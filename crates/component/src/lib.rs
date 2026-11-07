@@ -7,7 +7,10 @@
 
 mod amx;
 mod compat;
+mod guard;
 mod lifetime;
+#[cfg(test)]
+mod model;
 mod natives;
 mod state;
 
@@ -33,41 +36,52 @@ struct Api {
     shutdown: extern "C" fn(),
 }
 
+// Each of these runs inside `guard::catch`, as every native does, so a panic never
+// unwinds into the server.
+
 extern "C" fn script_loaded(amx: *mut amx::Amx) {
-    state::with(|st| st.loaded(amx));
+    guard::catch((), || state::with(|st| st.loaded(amx)));
 }
 
 extern "C" fn script_unloaded(amx: *mut amx::Amx) {
-    state::with(|st| st.unloaded(amx));
+    guard::catch((), || state::with(|st| st.unloaded(amx)));
 }
 
 extern "C" fn set_codepage(label: *const u8, len: usize) -> bool {
-    let label = unsafe { std::slice::from_raw_parts(label, len) };
-    let cp = std::str::from_utf8(label)
-        .ok()
-        .and_then(pawn_json_core::text::Codepage::from_label);
-    if let Some(cp) = cp {
-        state::with(|st| st.set_default_codepage(cp));
-    }
-    cp.is_some()
+    guard::catch(false, || {
+        let label = unsafe { std::slice::from_raw_parts(label, len) };
+        let cp = std::str::from_utf8(label)
+            .ok()
+            .and_then(pawn_json_core::text::Codepage::from_label);
+        if let Some(cp) = cp {
+            state::with(|st| st.set_default_codepage(cp));
+        }
+        cp.is_some()
+    })
 }
 
 extern "C" fn set_logger(ctx: *mut c_void, log: state::LogFn) {
-    state::with(|st| st.set_logger(ctx, log));
+    guard::catch((), || state::with(|st| st.set_logger(ctx, log)));
 }
 
-/// Every server tick: logs the saves that failed on the saver's thread.
+/// Every server tick: logs the saves that failed on the saver's thread, and gives every
+/// loop variable its budget of steps back.
 extern "C" fn tick() {
-    state::with(|st| {
-        st.report_failed_saves();
+    guard::catch((), || {
+        state::with(|st| {
+            st.report_failed_saves();
+            st.walks.new_tick();
+        })
     });
 }
 
 /// When the server shuts down: finishes every queued save before the thread stops.
 extern "C" fn shutdown() {
-    state::with(|st| {
-        st.saver.close();
-        st.report_failed_saves();
+    guard::catch((), || {
+        state::with(|st| {
+            st.saver.close();
+            st.report_failed_saves();
+        })
     });
 }
 
@@ -88,6 +102,7 @@ unsafe extern "C" {
 /// The only symbol the library exports. open.mp calls it once to get the component.
 #[unsafe(no_mangle)]
 pub extern "C" fn ComponentEntryPoint() -> *mut c_void {
+    guard::install_hook();
     unsafe { pj_component(&API) }
 }
 

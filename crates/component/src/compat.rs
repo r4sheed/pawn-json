@@ -13,7 +13,7 @@
 //! doesn't leak a handle per pass.
 
 use crate::amx::{Amx, Cell};
-use crate::natives::{Call, run};
+use crate::natives::{Call, run, run_zero};
 use crate::state::{Level, State};
 use pawn_json_core::dom::{Doc, NodeId, Val};
 use pawn_json_core::error::{Error, OK};
@@ -29,7 +29,7 @@ fn var(c: &Call, i: usize) -> Result<Cell, Error> {
 /// key, node, key, node... it is 1.x's builder and takes ownership of the nodes. A failure
 /// returns 0 rather than an error code, since a code could be mistaken for a node.
 pub extern "C" fn object(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 0, |c, st| {
+    run_zero(amx, params, 0, |c, st| {
         let n = c.args.count();
         if n % 2 != 0 {
             st.log(
@@ -62,7 +62,7 @@ pub extern "C" fn object(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `Node:JSON_Array(Node:...)`. With no arguments it makes an empty array; otherwise it is
 /// 1.x's builder and takes ownership of the nodes.
 pub extern "C" fn array(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 0, |c, st| {
+    run_zero(amx, params, 0, |c, st| {
         let mut doc = Doc::new(Val::Arr(Vec::new()));
         let mut taken = Vec::with_capacity(c.args.count());
         for i in 0..c.args.count() {
@@ -83,7 +83,7 @@ pub extern "C" fn array(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `Node:JSON_Append(Node:a, Node:b)`. Merges two objects, or joins two arrays, into a new
 /// node. As in 1.x, both inputs are consumed whether or not it succeeds.
 pub extern "C" fn append(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 2, |c, st| {
+    run_zero(amx, params, 2, |c, st| {
         let (a, b) = (c.args.cell(0), c.args.cell(1));
         let doc = match (st.pool.resolve(a), st.pool.resolve(b)) {
             (Some(x), Some(y)) => join(&st.pool, (x.doc, x.node), (y.doc, y.node)),

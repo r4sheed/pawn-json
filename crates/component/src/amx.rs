@@ -211,6 +211,11 @@ pub mod fake {
             (at * size_of::<Cell>()) as Cell
         }
 
+        /// Frees everything `put` placed from cell `at` on, for the next call's arguments.
+        pub fn rewind(&mut self, at: usize) {
+            self.heap = at;
+        }
+
         pub fn string(&mut self, s: &[u8]) -> Cell {
             let cells: Vec<Cell> = s.iter().map(|&b| b as Cell).chain([0]).collect();
             self.put(&cells)

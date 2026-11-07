@@ -38,6 +38,37 @@ pub(crate) fn run(
     arity: usize,
     body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
 ) -> Cell {
+    run_or(Error::Internal as Cell, amx, params, arity, body)
+}
+
+/// `run` for a native that returns a node, a bool or a count rather than a code. If it
+/// fails inside the plugin it returns 0, which is no node, false or none, where a code
+/// would read as a node handle, or as true and keep a loop going.
+pub(crate) fn run_zero(
+    amx: *mut Amx,
+    params: *const Cell,
+    arity: usize,
+    body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
+) -> Cell {
+    run_or(0, amx, params, arity, body)
+}
+
+fn run_or(
+    fallback: Cell,
+    amx: *mut Amx,
+    params: *const Cell,
+    arity: usize,
+    body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
+) -> Cell {
+    crate::guard::catch(fallback, || run_unguarded(amx, params, arity, body))
+}
+
+fn run_unguarded(
+    amx: *mut Amx,
+    params: *const Cell,
+    arity: usize,
+    body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
+) -> Cell {
     let args = unsafe { Args::new(amx, params) };
     if args.count() < arity {
         return Error::Address as Cell;
@@ -99,7 +130,7 @@ extern "C" fn json_get_int(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `JSON@Free(const Node:nodes[], len)`, which the include's `operator~` calls when a
 /// scope ends.
 extern "C" fn json_free(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 2, |c, st| {
+    run_zero(amx, params, 2, |c, st| {
         let len = usize::try_from(c.args.cell(1)).map_err(|_| Error::Address)?;
         let handles = c.args.cells(0, len).ok_or(Error::Address)?;
         let scope = c.args.data_cell(c.args.frame()).ok_or(Error::Address)?;
@@ -137,7 +168,7 @@ extern "C" fn json_release(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `Node:JSON_Up(Node:node)`. Writing `return JSON_Up(node);` hands the node to the
 /// caller.
 extern "C" fn json_up(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 1, |c, st| {
+    run_zero(amx, params, 1, |c, st| {
         let h = c.args.cell(0);
         let caller = c.args.data_cell(c.args.frame()).ok_or(Error::Address)?;
         lifetime::hand_up(&mut st.pool, h, c.owner.script, c.owner.frame, caller);
@@ -147,7 +178,7 @@ extern "C" fn json_up(amx: *mut Amx, params: *const Cell) -> Cell {
 
 /// `JSON_CountNodes()`. The number of live handles, across every script.
 extern "C" fn json_count_nodes(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 0, |_, st| Ok(st.pool.live_handles() as Cell))
+    run_zero(amx, params, 0, |_, st| Ok(st.pool.live_handles() as Cell))
 }
 
 fn string<'a>(c: &'a Call, i: usize) -> Result<&'a [Cell], Error> {
@@ -289,7 +320,7 @@ macro_rules! set_at {
 
 /// `Node:JSON_Copy(Node:node)`
 extern "C" fn json_copy(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 1, |c, st| {
+    run_zero(amx, params, 1, |c, st| {
         let h = api::copy(&mut st.pool, c.owner, c.args.cell(0));
         Ok(if h == 0 && st.pool.resolve(c.args.cell(0)).is_some() {
             made(st, h)
@@ -368,7 +399,7 @@ extern "C" fn json_stringify(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `bool:JSON_SetCodepage(const name[])`. Sets the calling script's code page from its
 /// WHATWG label, returning false for a label it doesn't support.
 extern "C" fn json_set_codepage(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 1, |c, st| {
+    run_zero(amx, params, 1, |c, st| {
         let label = pawn_json_core::text::to_string(string(c, 0)?, c.cp);
         Ok(match Codepage::from_label(&label) {
             Some(cp) => {
@@ -414,7 +445,7 @@ extern "C" fn json_get_node(amx: *mut Amx, params: *const Cell) -> Cell {
 
 /// `JSON_TypeOf(Node:node, const key[] = "")`
 extern "C" fn json_type_of(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 2, |c, st| {
+    run_zero(amx, params, 2, |c, st| {
         Ok(api::type_of(&st.pool, c.cp, c.args.cell(0), string(c, 1)?))
     })
 }
@@ -668,7 +699,7 @@ extern "C" fn json_array_get_node(amx: *mut Amx, params: *const Cell) -> Cell {
 
 /// `bool:JSON_HasKey(Node:node, const key[])`
 extern "C" fn json_has_key(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 2, |c, st| {
+    run_zero(amx, params, 2, |c, st| {
         Ok(api::has_key(&st.pool, c.cp, c.args.cell(0), string(c, 1)?) as Cell)
     })
 }
@@ -728,7 +759,7 @@ extern "C" fn json_unpack(amx: *mut Amx, params: *const Cell) -> Cell {
 
 /// `Node:JSON_Pack(const format[], {Float, bool, Node, _}:...)`
 extern "C" fn json_pack(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 1, |c, st| {
+    run_zero(amx, params, 1, |c, st| {
         let args = VarArgs {
             args: c.args,
             first: 1,
@@ -752,7 +783,11 @@ extern "C" fn json_get_as(amx: *mut Amx, params: *const Cell) -> Cell {
     const STRING: Cell = 8;
     run(amx, params, 5, |c, st| {
         let node = c.args.cell(0);
-        let mut v = 0;
+        // A node read replaces what the variable held, so it starts from that.
+        let mut v = match c.args.cell(2) {
+            NODE => c.args.read(4).ok_or(Error::Address)?,
+            _ => 0,
+        };
         let code = match c.args.cell(2) {
             STRING => {
                 return with_buffer(c, Some(1), 4, 3, |key, out| {
@@ -774,7 +809,7 @@ extern "C" fn json_get_as(amx: *mut Amx, params: *const Cell) -> Cell {
 
 /// `bool:JSON_Iter(Node:container, &Node:element)`
 extern "C" fn json_iter(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 2, |c, st| {
+    run_zero(amx, params, 2, |c, st| {
         let mut el = c.args.read(1).ok_or(Error::Address)?;
         let more = api::iter(
             &mut st.pool,
@@ -784,6 +819,7 @@ extern "C" fn json_iter(amx: *mut Amx, params: *const Cell) -> Cell {
             c.args.cell(0),
             &mut el,
         );
+        st.report_stopped_loop("JSON_Iter");
         put(c, 1, el)?;
         Ok(more as Cell)
     })
@@ -791,7 +827,7 @@ extern "C" fn json_iter(amx: *mut Amx, params: *const Cell) -> Cell {
 
 /// `bool:JSON_IterEntry(Node:object, key[], &Node:value, size = sizeof (key))`
 extern "C" fn json_iter_entry(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 4, |c, st| {
+    run_zero(amx, params, 4, |c, st| {
         let mut el = c.args.read(2).ok_or(Error::Address)?;
         let more = with_buffer(c, None, 1, 3, |_, out| {
             api::iter_entry(
@@ -805,6 +841,7 @@ extern "C" fn json_iter_entry(amx: *mut Amx, params: *const Cell) -> Cell {
                 &mut el,
             ) as Cell
         })?;
+        st.report_stopped_loop("JSON_IterEntry");
         put(c, 2, el)?;
         Ok(more)
     })
@@ -815,7 +852,7 @@ extern "C" fn json_iter_entry(amx: *mut Amx, params: *const Cell) -> Cell {
 /// of the key buffer. An empty buffer starts a new loop, and the buffer is emptied again
 /// when the keys run out.
 extern "C" fn json_iter_key(amx: *mut Amx, params: *const Cell) -> Cell {
-    run(amx, params, 3, |c, st| {
+    run_zero(amx, params, 3, |c, st| {
         let slot = (c.owner.script, c.args.cell(1));
         let size = usize::try_from(c.args.cell(2)).map_err(|_| Error::Address)?;
         let (p, n) = c.args.buffer(1, size).ok_or(Error::Address)?;
@@ -961,10 +998,48 @@ pub fn names() -> impl Iterator<Item = &'static str> {
     })
 }
 
+/// The native registered under `name`, for tests that call natives by their Pawn name.
+#[cfg(test)]
+pub fn find(name: &str) -> Native {
+    NATIVES
+        .0
+        .iter()
+        .find(|n| unsafe { std::ffi::CStr::from_ptr(n.name) }.to_str() == Ok(name))
+        .unwrap_or_else(|| panic!("no native {name}"))
+        .func
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::amx::fake::Script;
+
+    extern "C" fn fails_with_a_code(amx: *mut Amx, params: *const Cell) -> Cell {
+        run(amx, params, 0, |_, _| {
+            panic!("a bug in a native that returns a code")
+        })
+    }
+
+    extern "C" fn fails_with_a_node(amx: *mut Amx, params: *const Cell) -> Cell {
+        run_zero(amx, params, 0, |_, _| {
+            panic!("a bug in a native that returns a node")
+        })
+    }
+
+    /// A panic inside a native costs that one call: it returns JSON_ERR_INTERNAL, or 0
+    /// where 0 means no node or false, and the next call works as usual.
+    #[test]
+    fn a_native_that_panics_returns_and_the_next_call_works() {
+        let mut s = Script::new(256);
+        let before = crate::guard::caught();
+        assert_eq!(s.call(fails_with_a_code, &[]), Error::Internal as Cell);
+        assert_eq!(s.call(fails_with_a_node, &[]), 0);
+        assert_eq!(crate::guard::caught() - before, 2);
+        let text = s.string(b"[1]");
+        let node = s.put(&[0]);
+        assert_eq!(s.call(find("JSON_Parse"), &[text, node]), OK);
+        assert!(s.cell_at(node) > 0);
+    }
 
     #[test]
     fn parse_and_get_int_run_through_the_amx() {

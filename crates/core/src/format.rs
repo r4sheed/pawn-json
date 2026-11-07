@@ -268,10 +268,20 @@ impl<A: Args> Unpack<'_, '_, A> {
                 };
                 return self.args.set_string(i, leaf.size, s, self.cp).map_err(fail);
             }
-            _ => match self.pool.view(self.doc, n, self.owner) {
-                0 => return Err(fail(Error::Node)),
-                h => c = h,
-            },
+            _ => {
+                // As for any read of a child: the variable's view is moved, or what it
+                // held replaced.
+                let held = self.args.cell(i).unwrap_or(0);
+                match self.pool.walk(held, self.doc, n, self.owner) {
+                    0 => return Err(fail(Error::Node)),
+                    h => {
+                        if h != held {
+                            crate::api::overwrite(self.pool, self.owner, held);
+                        }
+                        c = h;
+                    }
+                }
+            }
         }
         if self.args.set(i, c) {
             Ok(())

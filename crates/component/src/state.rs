@@ -67,6 +67,16 @@ pub fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     STATE.with(|s| f(&mut s.borrow_mut()))
 }
 
+/// Logs a line if the state can be reached right now, and quietly doesn't if it can't,
+/// so reporting a failure can never fail in turn.
+pub fn try_log(level: Level, msg: &str) {
+    let _ = STATE.try_with(|s| {
+        if let Ok(st) = s.try_borrow() {
+            st.log(level, msg);
+        }
+    });
+}
+
 impl State {
     /// Looks up the calling script. A script whose load was never announced is registered
     /// on its first call.
@@ -124,6 +134,19 @@ impl State {
             self.log(Level::Warning, &format!("JSON_SaveFile: {why}"));
         }
         !failures.is_empty()
+    }
+
+    /// Logs it if a loop variable ran out of steps on this call.
+    pub fn report_stopped_loop(&mut self, native: &str) {
+        if self.walks.take_stopped() {
+            self.log(
+                Level::Error,
+                &format!(
+                    "{native}: a loop variable kept starting over on the same container, more than {} steps in one server tick, so its loop was stopped: it was going round for ever. Look for an inner loop over the same container on the same variable, or the variable set to 0 inside the loop.",
+                    pawn_json_core::api::STEP_BUDGET
+                ),
+            );
+        }
     }
 
     /// Logs that the pool has run out of handles, but only the first time. That means the

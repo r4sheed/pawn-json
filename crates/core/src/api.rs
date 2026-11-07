@@ -120,7 +120,11 @@ pub fn parse(pool: &mut Pool, cp: Codepage, owner: Owner, input: &[Cell], out: &
 /// or read into over and over doesn't leave a node behind each time. A copy of the old
 /// handle in another variable stops working, which is why kept handles are left alone.
 pub fn overwrite(pool: &mut Pool, owner: Owner, old: Cell) {
-    if pool.owner(old).is_some_and(|o| o.script == owner.script) && !pool.kept(old) {
+    overwrite_for(pool, owner.script, old);
+}
+
+fn overwrite_for(pool: &mut Pool, script: u32, old: Cell) {
+    if pool.owner(old).is_some_and(|o| o.script == script) && !pool.kept(old) {
         pool.release(old);
     }
 }
@@ -637,12 +641,46 @@ pub fn pack<A: crate::format::Args>(
 // A loop inside another that reuses the outer loop's variable is stacked on top of it.
 // When the inner loop runs out, or the outer one is stepped again after a `break`, the
 // variable holds the outer loop's element again and the outer loop carries on.
+//
+// Some mistakes can't be told from a correct loop: an inner loop over the very container
+// the outer loop walks, on the same variable, looks exactly like the outer loop's next
+// step, and `row = Node:0` inside a loop looks like a second loop started after the
+// first. Both walk the same container from the start again and again, for ever. The last
+// guard is a budget on exactly that: once a variable starts over on a container it has
+// already walked this server tick, its steps on that container are counted, and past
+// `STEP_BUDGET` its loops over it stop, which `take_stopped` tells the component so it
+// can log it. One long walk is never counted, however long, and a correct script that
+// walks one list again for every player stays far below the budget: two thousand
+// elements for a thousand players is two million.
 
 /// The loops in progress, keyed by script and element variable. Each variable has a stack,
 /// innermost loop last.
-#[derive(Default)]
 pub struct Walks {
     loops: HashMap<(u32, Cell), Vec<Walk>>,
+    /// This tick's walks, by script, variable and container (document, node and
+    /// generation).
+    rewalks: HashMap<(u32, Cell, u32, NodeId, u32), Rewalk>,
+    budget: u32,
+    /// Set when a loop runs out of steps, until `take_stopped`.
+    stopped: bool,
+}
+
+#[derive(Default)]
+struct Rewalk {
+    /// How often the variable started a walk of the container from the top.
+    starts: u32,
+    /// The steps taken since the second start.
+    steps: u32,
+}
+
+/// How many steps a variable may take, in one server tick, on a container it walks
+/// again from the top.
+pub const STEP_BUDGET: u32 = 5_000_000;
+
+impl Default for Walks {
+    fn default() -> Walks {
+        Walks::with_budget(STEP_BUDGET)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -655,9 +693,45 @@ struct Walk {
     /// The index of that element, and where the loop stops.
     index: u32,
     end: u32,
+    /// Whether this walk started over on a container the variable already walked this
+    /// tick, so that its steps count against the budget. Other walks never look at it.
+    counted: bool,
+}
+
+/// Whether a walk has used up its budget. The first time, it is recorded for the log.
+fn spent(r: &mut Rewalk, budget: u32, stopped: &mut bool) -> bool {
+    if r.steps < budget {
+        return false;
+    }
+    if r.steps == budget {
+        r.steps += 1;
+        *stopped = true;
+    }
+    true
 }
 
 impl Walks {
+    pub fn with_budget(budget: u32) -> Walks {
+        Walks {
+            loops: HashMap::new(),
+            rewalks: HashMap::new(),
+            budget,
+            stopped: false,
+        }
+    }
+
+    /// A new server tick: every variable gets its full budget of steps again.
+    pub fn new_tick(&mut self) {
+        if !self.rewalks.is_empty() {
+            self.rewalks.clear();
+        }
+    }
+
+    /// Whether a variable ran out of steps since the last call.
+    pub fn take_stopped(&mut self) -> bool {
+        std::mem::take(&mut self.stopped)
+    }
+
     /// Forgets the loops of the variables in `cells` cells from address `at`, the
     /// variables of a scope that is ending, and releases the elements the loops made.
     pub fn forget(&mut self, pool: &mut Pool, script: u32, at: Cell, cells: usize) {
@@ -724,14 +798,13 @@ fn advance(
         return None;
     }
     let Ok((d, node)) = found(pool, container) else {
-        // The container is gone. If the variable holds what its loop last put there,
-        // that loop is over.
-        if holds_top {
-            finish(pool, walks, key, el);
-        }
+        // No container, so no loop. Which loop of this variable the call was meant to
+        // step can't be told - an inner loop over a child that isn't there looks the
+        // same as the outer loop's container going away - so none of them is touched.
         return None;
     };
     let generation = pool.doc(d).generation(node);
+    let walked = (owner.script, var, d, node, generation);
     let len = match pool.doc(d).val(node) {
         Val::Obj(m) => m.len(),
         Val::Arr(v) if !objects_only => v.len(),
@@ -743,22 +816,40 @@ fn advance(
     match stack.iter().rposition(this) {
         Some(k) if holds_top => {
             // This loop is under way. Loops stacked on it were left with `break`.
+            if stack[k].counted
+                && walks
+                    .rewalks
+                    .get_mut(&walked)
+                    .is_some_and(|r| spent(r, walks.budget, &mut walks.stopped))
+            {
+                return None;
+            }
             if k + 1 < stack.len() {
                 for w in stack.drain(k + 1..) {
-                    release_element(pool, owner.script, w.handle);
+                    if w.handle != container {
+                        release_element(pool, owner.script, w.handle);
+                    }
                 }
                 *el = stack[k].handle;
             }
         }
         _ => {
+            let r = walks.rewalks.entry(walked).or_default();
+            r.starts += 1;
+            let counted = r.starts > 1;
+            if counted && spent(r, walks.budget, &mut walks.stopped) {
+                return None;
+            }
             if holds_top {
                 // A loop inside another, on the outer loop's variable: the outer
                 // element stays as it is, for when this loop is done.
                 fresh_view = true;
             } else {
-                // The variable holds something else, so any loop it had is over.
+                // The variable holds something else, so any loop it had is over. Its
+                // elements go, except one that is now the container being walked: that
+                // handle may be all that keeps the document alive.
                 for w in stack.drain(..) {
-                    if w.handle != *el {
+                    if w.handle != *el && w.handle != container {
                         release_element(pool, owner.script, w.handle);
                     }
                 }
@@ -770,6 +861,7 @@ fn advance(
                 generation,
                 index: u32::MAX,
                 end: len as u32,
+                counted,
             });
         }
     }
@@ -809,22 +901,36 @@ fn advance(
         .expect("the loop is still there");
     top.handle = h;
     top.index = at;
+    if top.counted
+        && let Some(r) = walks.rewalks.get_mut(&walked)
+    {
+        r.steps += 1;
+    }
     Some((at as usize, id))
 }
 
 /// Ends the innermost loop of a variable: its element is released, and the variable
-/// gets back the element of the loop under it, or 0.
+/// gets back the element of the loop under it, or 0. A loop that ends on its first step
+/// never put anything in the variable, so what the variable held is replaced as
+/// `overwrite` says.
 fn finish(pool: &mut Pool, walks: &mut Walks, key: (u32, Cell), el: &mut Cell) {
     let Some(stack) = walks.loops.get_mut(&key) else {
         *el = 0;
         return;
     };
-    if let Some(w) = stack.pop()
-        && w.handle != 0
-    {
-        release_element(pool, key.0, w.handle);
+    match stack.pop() {
+        Some(w) if w.handle != 0 => release_element(pool, key.0, w.handle),
+        _ => {}
     }
-    *el = stack.last().map_or(0, |w| w.handle);
+    let next = stack.last().map_or(0, |w| w.handle);
+    if *el != next {
+        let held = *el;
+        let ours = stack.iter().any(|w| w.handle == held);
+        if !ours {
+            overwrite_for(pool, key.0, held);
+        }
+    }
+    *el = next;
     if stack.is_empty() {
         walks.loops.remove(&key);
     }
@@ -1643,6 +1749,77 @@ mod tests {
         }
         assert_eq!(seen, [1, 2, 4, 5]);
         assert_eq!((row, walks.len(), pool.live_handles()), (0, 0, 1));
+    }
+
+    /// The loops that can't be told from correct ones still end, by the step budget, and
+    /// say so. A new tick gives the variable its budget back.
+    #[test]
+    fn an_endless_loop_is_stopped_by_the_budget() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::with_budget(1_000);
+        let list = root(&mut pool, "[1,2,3]");
+        let (mut row, mut outer) = (0, 0);
+        // An inner loop over the same container, on the same variable.
+        while iter(&mut pool, &mut walks, ME, var("row"), list, &mut row) {
+            while iter(&mut pool, &mut walks, ME, var("row"), list, &mut row) {}
+            outer += 1;
+            assert!(outer < 10_000, "the budget did not stop the loop");
+        }
+        assert!(walks.take_stopped());
+        assert!(!walks.take_stopped(), "it is told once");
+        // The variable set back to 0 inside the loop. Each step starts over; the first
+        // walk is free, the budget counts from the second.
+        walks.new_tick();
+        let mut steps = 0;
+        while iter(&mut pool, &mut walks, ME, var("cell"), list, &mut row) {
+            row = 0;
+            steps += 1;
+            assert!(steps < 10_000, "the budget did not stop the loop");
+        }
+        assert_eq!(steps, 1_001);
+        assert!(walks.take_stopped());
+        // One long walk is never counted, however long.
+        walks.new_tick();
+        let long = root(&mut pool, &format!("[{}]", vec!["0"; 5_000].join(",")));
+        let (mut el, mut steps) = (0, 0);
+        while iter(&mut pool, &mut walks, ME, var("el"), long, &mut el) {
+            steps += 1;
+        }
+        assert_eq!(steps, 5_000);
+        assert!(!walks.take_stopped());
+        // A new tick, and a correct loop runs in full.
+        walks.new_tick();
+        let mut el = 0;
+        let mut steps = 0;
+        while iter(&mut pool, &mut walks, ME, var("el"), list, &mut el) {
+            steps += 1;
+        }
+        assert_eq!(steps, 3);
+        assert!(!walks.take_stopped());
+    }
+
+    /// Found by the model test: a loop left half done, whose element then becomes the
+    /// container of a new loop on the same variable. Ending the old loop must not free
+    /// the container the new one walks.
+    #[test]
+    fn a_left_loop_s_element_can_be_the_next_loop_s_container() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let o = root(&mut pool, r#"{"a":{"x":1,"y":2}}"#);
+        let mut row = 0;
+        assert!(iter(&mut pool, &mut walks, ME, var("row"), o, &mut row));
+        let inner = row;
+        // The only handle into the document now is `inner`, the left loop's element.
+        pool.release(o);
+        let mut fresh = root(&mut pool, "{}");
+        let mut steps = 0;
+        while iter(&mut pool, &mut walks, ME, var("row"), inner, &mut fresh) {
+            steps += 1;
+        }
+        assert_eq!(steps, 2);
+        let mut v = 0;
+        assert_eq!(get_int(&pool, CP, inner, &s("y"), &mut v), OK);
+        assert_eq!(v, 2);
     }
 
     #[test]

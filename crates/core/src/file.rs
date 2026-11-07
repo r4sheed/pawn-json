@@ -254,10 +254,18 @@ fn finish_queued(shared: &Shared) {
                 q = shared.work.wait(q).unwrap_or_else(PoisonError::into_inner);
             }
         };
-        let result = finish(job.file, &job.tmp, &job.path);
+        // A bug here must not stop the thread with the save still counted as open, or
+        // `flush` would wait for ever; it counts as a failed save instead.
+        let Job { file, tmp, path } = job;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finish(file, &tmp, &path)))
+                .unwrap_or_else(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(io::Error::other("the save failed inside the plugin"))
+                });
         let mut q = lock(&shared.queue);
         if let Err(e) = result {
-            q.failures.push(format!("{}: {e}", job.path));
+            q.failures.push(format!("{path}: {e}"));
             shared.failed.store(true, Ordering::Release);
         }
         q.open -= 1;

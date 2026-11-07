@@ -14,5 +14,9 @@ crate-type = ["cdylib"]
 mimalloc = { version = "0.1", default-features = false }
 pawn-json-core = { path = "../core" }
 
+[dev-dependencies]
+# Random scripts for the model test in src/model.rs.
+proptest = "1"
+
 [build-dependencies]
 cc = "1"

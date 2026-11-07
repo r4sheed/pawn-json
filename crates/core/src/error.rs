@@ -25,6 +25,8 @@ pub enum Error {
     Format = 10,
     /// An argument's address points outside the script's data.
     Address = 11,
+    /// The call hit a bug in the plugin and was stopped; the server log says where.
+    Internal = 12,
 }
 
 pub const OK: i32 = 0;

@@ -12,5 +12,4 @@ repository = "https://github.com/r4sheed/pawn-json"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true

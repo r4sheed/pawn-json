@@ -546,6 +546,25 @@ static Loops()
     JSON_GetNode(other, "n", inner);
     T_True(!JSON_Iter(inner, row));
     T_True(!JSON_Iter(Node:123456, row));
+
+    // An inner loop over the very container the outer loop walks, on the same variable,
+    // can't be told from the outer loop's next step, and would go round for ever. The
+    // plugin stops it once the variable has started over on that container too often in
+    // one tick, and logs it. The variable is one of its own, since it has no steps left
+    // on that container for the rest of the tick.
+    new Node:runaway, cycles = 0;
+    JSON_Parse("[1,2,3]", list);
+    while (JSON_Iter(list, runaway))
+    {
+        while (JSON_Iter(list, runaway))
+        {
+        }
+        if (++cycles > 50000000)
+        {
+            break;
+        }
+    }
+    T_True(cycles < 50000000);
 }
 
 // Files that aren't there, aren't files, or are written over and over.

@@ -73,6 +73,9 @@ const JSON_ERR_FILE = 8;
 const JSON_ERR_PATH = 9;
 const JSON_ERR_FORMAT = 10;
 const JSON_ERR_ADDRESS = 11;
+// The call ran into a bug in the plugin and was stopped there, so the server carries
+// on. The server log says where; please report it.
+const JSON_ERR_INTERNAL = 12;
 
 const JSON_MISSING = 0;
 const JSON_NULL = 1;
@@ -273,6 +276,13 @@ native JSON_GetAs(Node:node, const key[], kind, size, {Float, bool, Node, _}:...
 //
 // Works on an array's elements or an object's values. A container can't be walked into
 // its own variable: JSON_Iter(list, list) returns false and leaves `list` alone.
+//
+// Two mistakes look exactly like correct loops and would go round for ever: an inner
+// loop over the same container as the outer one on the same variable, and `row = Node:0`
+// inside the loop. Both keep starting over on the same container. As a last guard, once
+// a variable has started over on a container in one server tick and taken five million
+// more steps on it, its loops over it stop and the server log says so. A correct script
+// never gets near that.
 native bool:JSON_Iter(Node:container, &Node:element);
 
 // An object's keys, in file order. This starts when `key` is empty, as a new array is,

@@ -89,6 +89,10 @@ functions - `JSON_GetObject`, `JSON_ArrayIterate`, `JSON_Object("key", JSON_Int(
 the rest - are at the end of the file. They return the same codes as everything else;
 0 still means success.
 
+If the plugin itself has a bug, it costs that one call, not the server: the call
+returns `JSON_ERR_INTERNAL` (or 0, for a function that returns a node or a bool) and
+the server log says where it happened.
+
 ## Build
 
 ```

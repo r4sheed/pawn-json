@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a94787311a69219a83ca4bf643935321434ef43cd2f985c39a6bba5ece5cc26a # shrinks to ops = [Parse(Var(6), 2), Parse(Var(0), 0), Step(Var(2), Var(0))]
+cc 35ab542b33d7a7f53a306a89d72fd66ecf97e5a65169103188abcf74db5b9578 # shrinks to ops = [Parse(Var(1), 0), Loop(Var(5), Var(0), [InnerLoopOnSameVariable(0)])]
+cc 6e3e217b4a0f3c9a3bfc8585d7184fd1f9f52c3e48c2f02151cb03b47d7f99f3 # shrinks to ops = [Parse(Var(4), 7), Loop(Var(0), Var(3), [InnerLoopOnSameVariable(0)])]
+cc 2c3db689255de079110d32f471ea9b976f7c841162e7e0fe4c6451d5761f1cf7 # shrinks to ops = [Parse(Var(6), 0), Unpack(Var(2), 1, Var(0))]
+cc 0646b50caf4b7198ffc7ac93f20e2f0c42686901618c9583f02bf7d2b6656f17 # shrinks to ops = [Parse(Var(4), 0), Unpack(Var(4), 1, Var(4))]
+cc cacc116119bc02a1b2aff1c0aeda60701806b9a93f60f9f6583cbffc23c5df1d # shrinks to ops = [Parse(Var(1), 0), StepEntry(Var(1), Var(2)), Parse(Var(4), 0), Loop(Var(4), Var(2), [InnerLoopOnSameVariable(0)])]
+cc f5c410d171d8e66d14bc45d7de803c4bb87b9b3535a4b5f73dae1f3131b73cc8 # shrinks to ops = [Parse(Var(5), 7), Copy(Var(1), Var(2)), PathNode(Var(2), 4, Var(5)), Loop(Var(5), Var(3), [InnerLoopOnSameVariable(0)])]
+cc a0c51279c32bf19ad68a46756afe2bcd969cef18291c45129c7061e29e537e9d # shrinks to ops = [Parse(Var(5), 0), Build(0, Var(1), Var(3)), Step(Var(0), Var(0)), Assign(Var(3), Var(2)), Step(Var(2), Var(1)), Loop(Var(1), Var(2), [Nothing]), Assign(Var(5), Var(3)), Save(Var(0), 0), Parse(Var(2), 0), Object(Var(5)), Step(Var(3), Var(5))]
