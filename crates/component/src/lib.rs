@@ -29,6 +29,8 @@ struct Api {
     script_unloaded: extern "C" fn(*mut amx::Amx),
     set_codepage: extern "C" fn(*const u8, usize) -> bool,
     set_logger: extern "C" fn(*mut c_void, state::LogFn),
+    tick: extern "C" fn(),
+    shutdown: extern "C" fn(),
 }
 
 extern "C" fn script_loaded(amx: *mut amx::Amx) {
@@ -54,12 +56,29 @@ extern "C" fn set_logger(ctx: *mut c_void, log: state::LogFn) {
     state::with(|st| st.set_logger(ctx, log));
 }
 
+/// Every server tick: logs the saves that failed on the saver's thread.
+extern "C" fn tick() {
+    state::with(|st| {
+        st.report_failed_saves();
+    });
+}
+
+/// When the server shuts down: finishes every queued save before the thread stops.
+extern "C" fn shutdown() {
+    state::with(|st| {
+        st.saver.close();
+        st.report_failed_saves();
+    });
+}
+
 static API: Api = Api {
     natives: natives::natives,
     script_loaded,
     script_unloaded,
     set_codepage,
     set_logger,
+    tick,
+    shutdown,
 };
 
 unsafe extern "C" {

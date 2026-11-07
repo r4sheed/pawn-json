@@ -20,10 +20,12 @@ they are, so the same file loads in a few milliseconds.
 
 ## Install
 
-With sampctl, add the package to your `pawn.json` dependencies; it puts the library in
-`components/` and the include where the compiler finds it. By hand: copy `pawn-json.dll`
-(or `pawn-json.so` on Linux) into the server's `components/` folder and `json.inc` onto
-your include path. It needs open.mp; there's no `legacy_plugins` entry to add.
+With sampctl, add `"r4sheed/pawn-json:v0.1.0"` (with the `v`) to your `pawn.json`
+dependencies. `sampctl ensure` puts the include where the compiler finds it and unpacks
+the library under `dependencies/.resources/`; copy it from there into the server's
+`components/`. By hand: copy `pawn-json.dll` (or `pawn-json.so` on Linux) into
+`components/` and `json.inc` onto your include path. It needs open.mp; there's no
+`legacy_plugins` entry to add.
 
 The default code page comes from `config.json`, and is `windows-1252` if you don't set it:
 
@@ -68,10 +70,20 @@ once it runs out. To hand a node back to your caller from a `Node:` variable, us
 inline function that runs later - call `JSON_Keep(node)`, and `JSON_Release(node)` when
 you're done with it.
 
+A document you keep open is cheap to read from at any time: a value is a lookup, well
+under a microsecond, so there's no need to copy a file into Pawn arrays first. Opening
+the file again for every read is what costs, a few milliseconds for a few hundred
+kilobytes.
+
+Saving rewrites the whole file, through a temporary one, so a crash can't leave it
+half-written. The wait for the disk happens in the background: `JSON_SaveFile` returns
+once the text is in the temporary file, `JSON_ParseFile` waits for pending saves so it
+reads what you saved, and the server finishes them before it shuts down. If you change
+a file often, change the document right away and save it on a timer.
+
 Everything returns `JSON_OK` or a `JSON_ERR_*` code, and functions that create a node
 return it (or 0). `json.inc` documents every function: reads by key, by path
-(`"/vehicles/3/model"`) and by index, writes, files (saving goes through a temporary
-file, so a crash can't leave a half-written one), loops, `JSON_Get`, which picks the
+(`"/vehicles/3/model"`) and by index, writes, files, loops, `JSON_Get`, which picks the
 right read from your variable's tag, and `JSON_Pack` / `JSON_Unpack`. The pawn-json 1.x
 functions - `JSON_GetObject`, `JSON_ArrayIterate`, `JSON_Object("key", JSON_Int(1))` and
 the rest - are at the end of the file. They return the same codes as everything else;

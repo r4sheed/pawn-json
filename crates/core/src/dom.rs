@@ -29,7 +29,7 @@ impl Val {
         if !x.is_finite() {
             return Val::Float(x as f64);
         }
-        let mut b = ryu::Buffer::new();
+        let mut b = zmij::Buffer::new();
         Val::Float(b.format_finite(x).parse().unwrap_or(x as f64))
     }
 
@@ -431,6 +431,33 @@ mod tests {
         match doc.val(doc.root()) {
             Val::Obj(m) => m.keys().map(|k| &**k).collect(),
             _ => vec![],
+        }
+    }
+
+    /// A Pawn float has to land on the same f64 it always did, or a value saved and read
+    /// back would change. Checked against ryu, which `from_f32` used before, on a sweep of
+    /// f32 bit patterns. Every finite f32 was compared once when the switch was made.
+    #[test]
+    fn a_pawn_float_is_stored_as_it_always_was() {
+        let mut bits = 0u32;
+        loop {
+            let x = f32::from_bits(bits);
+            let Val::Float(got) = Val::from_f32(x) else {
+                panic!()
+            };
+            let want: f64 = if x.is_finite() {
+                ryu::Buffer::new().format_finite(x).parse().unwrap()
+            } else {
+                x as f64
+            };
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "{x:e}"
+            );
+            match bits.checked_add(9_973) {
+                Some(next) => bits = next,
+                None => break,
+            }
         }
     }
 

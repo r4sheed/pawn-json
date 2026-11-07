@@ -145,10 +145,12 @@ dependencies = [
  "encoding_rs",
  "indexmap",
  "itoa",
+ "mimalloc",
  "rustc-hash",
  "ryu",
  "serde",
  "serde_json",
+ "zmij",
 ]
 
 [[package]]

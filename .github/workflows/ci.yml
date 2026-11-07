@@ -16,6 +16,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test --workspace --exclude jsonbench --target i686-pc-windows-msvc
+      - run: cargo test --release -p pawn-json-core --test speed --target i686-pc-windows-msvc -- --nocapture
       - run: cargo build --release --target i686-pc-windows-msvc -p pawn-json
       - run: python tools/exports.py target/i686-pc-windows-msvc/release/pawn_json.dll
 
@@ -29,5 +30,6 @@ jobs:
       - run: rustup target add i686-unknown-linux-gnu
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --exclude jsonbench --target i686-unknown-linux-gnu
+      - run: cargo test --release -p pawn-json-core --test speed --target i686-unknown-linux-gnu -- --nocapture
       - run: cargo build --release --target i686-unknown-linux-gnu -p pawn-json
       - run: python3 tools/exports.py target/i686-unknown-linux-gnu/release/libpawn_json.so

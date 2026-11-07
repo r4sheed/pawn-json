@@ -89,10 +89,26 @@ fn scalar(v: &Val, out: &mut String) {
         Val::Bool(true) => out.push_str("true"),
         Val::Bool(false) => out.push_str("false"),
         Val::Int(i) => out.push_str(itoa::Buffer::new().format(*i)),
-        Val::Float(f) if f.is_finite() => out.push_str(ryu::Buffer::new().format_finite(*f)),
+        Val::Float(f) if f.is_finite() => float(*f, out),
         Val::Float(_) => out.push_str("null"),
         Val::Str(s) => string(s, out),
         Val::Arr(_) | Val::Obj(_) => unreachable!(),
+    }
+}
+
+/// Writes a finite float as its shortest decimal that reads back the same. zmij finds
+/// those digits about three times faster than ryu did, but writes a positive exponent as
+/// `e+38`. Dropping the `+` keeps the text exactly as ryu wrote it, `3.4028235e38`, so a
+/// file saved now is byte for byte what an older version saved.
+fn float(f: f64, out: &mut String) {
+    let mut b = zmij::Buffer::new();
+    let s = b.format_finite(f);
+    match s.find("e+") {
+        Some(e) => {
+            out.push_str(&s[..=e]);
+            out.push_str(&s[e + 2..]);
+        }
+        None => out.push_str(s),
     }
 }
 
@@ -157,6 +173,45 @@ mod tests {
                 panic!()
             };
             assert_eq!(*f as f32, *x);
+        }
+    }
+
+    /// Every float the writer prints must read exactly as ryu printed it, since that is
+    /// what files saved by earlier versions hold. The sample is fixed: random bit
+    /// patterns, the edges where the notation changes, and Pawn floats as `from_f32`
+    /// stores them.
+    #[test]
+    fn floats_are_written_exactly_as_before() {
+        let mut floats = vec![0.0, -0.0, f64::MIN_POSITIVE, f64::MAX, f64::MIN, 5e-324];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            floats.push(f64::from_bits(x));
+        }
+        for e in -324..=308 {
+            for m in [1.0, 1.5, 2.5, 9.999999, 0.1, 123456789.0] {
+                floats.push(m * 10f64.powi(e));
+                floats.push(-m * 10f64.powi(e));
+            }
+        }
+        for i in 0..4096u64 {
+            floats.push(i as f64 / 64.0);
+            floats.push(((1u64 << 53) - i) as f64);
+        }
+        let mut bits = 0u32;
+        while let Some(next) = bits.checked_add(40_009) {
+            if let Val::Float(f) = Val::from_f32(f32::from_bits(bits)) {
+                floats.push(f);
+            }
+            bits = next;
+        }
+        let mut out = String::new();
+        for f in floats.into_iter().filter(|f| f.is_finite()) {
+            out.clear();
+            float(f, &mut out);
+            assert_eq!(out, ryu::Buffer::new().format_finite(f), "{f:e}");
         }
     }
 

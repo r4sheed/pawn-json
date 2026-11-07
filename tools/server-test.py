@@ -42,9 +42,29 @@ TIMEOUT_S = 60
 SERVER_FILES = ["omp-server.exe", "components/Pawn.dll", "components/Console.dll"]
 PAWNCC_FILES = ["pawncc.exe", "pawnc.dll"]
 
-# Files a test writes that it can't check from Pawn: we look at the bytes afterwards.
+# Files a test writes that it can't check from Pawn: we look at the bytes after the
+# server has exited. Each is deleted before the run, so a file an earlier run left can't
+# pass for it.
 FILE_CHECKS = {
-    "codepage": ("scriptfiles/codepage.json", ('{"n":"' + chr(0x151) + chr(0xE1) + 'x"}').encode("utf-8")),
+    "codepage": [("scriptfiles/codepage.json", ('{"n":"' + chr(0x151) + chr(0xE1) + 'x"}').encode("utf-8"))],
+    # Saves queued right before the exit, which the server has to finish first.
+    "save": [(f"scriptfiles/exit-{k}.json",
+              ('{"i":%d,"pad":[%s]}' % (k, ",".join(map(str, range(300))))).encode("utf-8"))
+             for k in range(30)],
+}
+
+
+def prepare_save():
+    # A folder where the test saves a file, so the rename at the end of that save fails.
+    taken = os.path.join(SERVER, "scriptfiles", "save-taken")
+    os.makedirs(taken, exist_ok=True)
+    with open(os.path.join(taken, "inside"), "w") as f:
+        f.write("x")
+
+
+# What a test needs in place before its server starts.
+PREPARE = {
+    "save": prepare_save,
 }
 
 
@@ -192,6 +212,12 @@ def main():
             continue
         write_config(name)
         os.makedirs(os.path.join(SERVER, "scriptfiles"), exist_ok=True)
+        checks = FILE_CHECKS.get(name, [])
+        for rel, _ in checks:
+            if os.path.exists(os.path.join(SERVER, rel)):
+                os.remove(os.path.join(SERVER, rel))
+        if name in PREPARE:
+            PREPARE[name]()
         lines, result, killed = run_server()
         loaded = [l for l in lines if "pawn-json" in l and "loaded" in l.lower()]
         for l in lines:
@@ -199,12 +225,11 @@ def main():
                 print("  " + l)
         status = "no PASS line" if result is None else f"PASS {result[0]} FAIL {result[1]}"
         print(f"{name}: {status}{', killed' if killed else ''}; {loaded[0].strip() if loaded else 'component not loaded'}")
-        check = FILE_CHECKS.get(name)
-        if check:
-            path = os.path.join(SERVER, check[0])
+        for rel, want in checks:
+            path = os.path.join(SERVER, rel)
             held = open(path, "rb").read() if os.path.exists(path) else b""
-            if held != check[1]:
-                print(f"  {check[0]} holds {held!r}, want {check[1]!r}")
+            if held != want:
+                print(f"  {rel} holds {held[:80]!r}, want {want[:80]!r}")
                 result = None
         if result is None or result[1] != 0 or killed or not loaded:
             failed += 1

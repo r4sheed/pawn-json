@@ -297,7 +297,14 @@ extern "C" fn json_copy(amx: *mut Amx, params: *const Cell) -> Cell {
 extern "C" fn json_parse_file(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 2, |c, st| {
         let mut node = 0;
-        let (code, why) = api::parse_file(&mut st.pool, c.cp, c.owner, string(c, 0)?, &mut node);
+        let (code, why) = api::parse_file(
+            &mut st.pool,
+            &st.saver,
+            c.cp,
+            c.owner,
+            string(c, 0)?,
+            &mut node,
+        );
         if let Some(why) = why {
             st.log(Level::Warning, &format!("JSON_ParseFile: {why}"));
         }
@@ -310,11 +317,13 @@ extern "C" fn json_parse_file(amx: *mut Amx, params: *const Cell) -> Cell {
 }
 
 /// `JSON_SaveFile(const path[], Node:node, bool:pretty = false)`. The path comes first to
-/// keep 1.x's argument order.
+/// keep 1.x's argument order. The wait for the disk happens on the saver's thread; a
+/// failure there is logged on the next server tick.
 extern "C" fn json_save_file(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 3, |c, st| {
         let (code, why) = api::save_file(
             &st.pool,
+            &mut st.saver,
             c.cp,
             c.args.cell(1),
             string(c, 0)?,
@@ -324,6 +333,20 @@ extern "C" fn json_save_file(amx: *mut Amx, params: *const Cell) -> Cell {
             st.log(Level::Warning, &format!("JSON_SaveFile: {why}"));
         }
         Ok(code)
+    })
+}
+
+/// `JSON_Flush()`. Waits until every save made so far is on the disk under its own name.
+/// Answers `JSON_ERR_FILE` if one of them could not be finished; the server log says
+/// which.
+extern "C" fn json_flush(amx: *mut Amx, params: *const Cell) -> Cell {
+    run(amx, params, 0, |_, st| {
+        st.saver.flush();
+        Ok(if st.report_failed_saves() {
+            Error::File as Cell
+        } else {
+            OK
+        })
     })
 }
 
@@ -832,6 +855,7 @@ static NATIVES: Table = table![
     c"JSON_Copy" => json_copy,
     c"JSON_ParseFile" => json_parse_file,
     c"JSON_SaveFile" => json_save_file,
+    c"JSON_Flush" => json_flush,
     c"JSON_Stringify" => json_stringify,
     c"JSON_SetCodepage" => json_set_codepage,
     c"JSON_GetFloat" => json_get_float,

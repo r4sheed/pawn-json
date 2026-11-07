@@ -105,7 +105,20 @@ native JSON_ParseFile(const path[], &Node:node);
 
 // Saving writes to a temporary file first and then swaps it in, so if the server dies
 // halfway through, the old file is still there in one piece.
+//
+// Waiting for the disk is most of a save's time, so that part runs in the background:
+// JSON_SaveFile returns as soon as the text is in the temporary file, and the swap
+// follows a few milliseconds later. A path that can't be written to still answers
+// JSON_ERR_FILE right away; a failure later on goes to the server log. JSON_ParseFile
+// always waits for pending saves, so it reads what you just saved, and the server waits
+// for them before it shuts down. If the server crashes in between, that one save is lost
+// and the old file stays as it was.
 native JSON_SaveFile(const path[], Node:node, bool:pretty = false);
+
+// Waits until every save so far is on the disk. You only need this before reading a
+// saved file some other way than JSON_ParseFile, for example with fopen. Answers
+// JSON_ERR_FILE if one of them could not be finished; the server log says which.
+native JSON_Flush();
 
 // If the buffer is too small you get as much as fits, and JSON_ERR_BUFFER.
 native JSON_Stringify(Node:node, output[], size = sizeof (output), bool:pretty = false);

@@ -9,6 +9,7 @@
 
 use crate::dom::{Doc, NodeId, Val};
 use crate::error::{Error, OK, Type, code};
+use crate::file::Saver;
 use crate::pool::{Cell, Owner, Pool, Walk};
 use crate::text::{self, Codepage};
 use crate::write;
@@ -500,15 +501,19 @@ pub fn array_remove(pool: &mut Pool, arr: Cell, index: Cell) -> Cell {
 
 // Files. Each returns its code and, when something went wrong, a line for the server log.
 
-/// `JSON_ParseFile(const path[], &Node:node)`.
+/// `JSON_ParseFile(const path[], &Node:node)`. Saves still being finished are waited for
+/// first, so a file read straight after `JSON_SaveFile` holds what was saved, however its
+/// path is spelled.
 pub fn parse_file(
     pool: &mut Pool,
+    saver: &Saver,
     cp: Codepage,
     owner: Owner,
     path: &[Cell],
     out: &mut Cell,
 ) -> (Cell, Option<String>) {
     *out = 0;
+    saver.flush();
     let path = text::to_string(path, cp);
     match crate::file::load(&path) {
         Ok(doc) => match pool.root(doc, owner) {
@@ -526,9 +531,11 @@ pub fn parse_file(
     }
 }
 
-/// `JSON_SaveFile(Node:node, const path[], bool:pretty)`.
+/// `JSON_SaveFile(Node:node, const path[], bool:pretty)`. Returns once the text is in a
+/// temporary file beside `path`; `saver` finishes the rest on its thread.
 pub fn save_file(
     pool: &Pool,
+    saver: &mut Saver,
     cp: Codepage,
     node: Cell,
     path: &[Cell],
@@ -539,7 +546,7 @@ pub fn save_file(
         Err(e) => return (e as Cell, None),
     };
     let path = text::to_string(path, cp);
-    match crate::file::save(pool.doc(d), id, &path, pretty) {
+    match saver.save(pool.doc(d), id, &path, pretty) {
         Ok(()) => (OK, None),
         Err(e) => (Error::File as Cell, Some(format!("{path}: {e}"))),
     }
@@ -1038,17 +1045,59 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.json").to_string_lossy().into_owned();
         let mut pool = Pool::default();
+        let mut saver = Saver::default();
         let o = root(&mut pool, r#"{"z":1,"a":[true,null]}"#);
-        assert_eq!(save_file(&pool, CP, o, &s(&path), true), (OK, None));
+        assert_eq!(
+            save_file(&pool, &mut saver, CP, o, &s(&path), true),
+            (OK, None)
+        );
         let mut back = 0;
         assert_eq!(
-            parse_file(&mut pool, CP, ME, &s(&path), &mut back),
+            parse_file(&mut pool, &saver, CP, ME, &s(&path), &mut back),
             (OK, None)
         );
         assert_eq!(dump(&pool, back), r#"{"z":1,"a":[true,null]}"#);
-        let (code, why) = parse_file(&mut pool, CP, ME, &s(&format!("{path}.none")), &mut back);
+        let (code, why) = parse_file(
+            &mut pool,
+            &saver,
+            CP,
+            ME,
+            &s(&format!("{path}.none")),
+            &mut back,
+        );
         assert_eq!((code, back), (Error::File as Cell, 0));
         assert!(why.unwrap().contains("api.json.none"));
+    }
+
+    /// A read straight after a save must see it, even when the thread has not got to it
+    /// yet and even when the path is spelled differently.
+    #[test]
+    fn a_file_read_right_after_a_save_holds_what_was_saved() {
+        let dir = std::env::temp_dir().join("pawn-json-core-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir
+            .join("read-after-save.json")
+            .to_string_lossy()
+            .into_owned();
+        let other = path.replace("read-after-save.json", "./read-after-save.json");
+        let mut pool = Pool::default();
+        let mut saver = Saver::default();
+        for i in 0..50 {
+            let o = root(&mut pool, &format!(r#"{{"n":{i}}}"#));
+            assert_eq!(
+                save_file(&pool, &mut saver, CP, o, &s(&path), false),
+                (OK, None)
+            );
+            let mut back = 0;
+            let spelled = if i % 2 == 0 { &path } else { &other };
+            assert_eq!(
+                parse_file(&mut pool, &saver, CP, ME, &s(spelled), &mut back),
+                (OK, None)
+            );
+            assert_eq!(dump(&pool, back), format!(r#"{{"n":{i}}}"#));
+            pool.release(back);
+            pool.release(o);
+        }
     }
 
     #[test]

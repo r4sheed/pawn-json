@@ -2,12 +2,13 @@
 // copy of the MPL was not distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/. The original code is copyright (c) rasheed.
 
-//! What the component keeps between native calls: the handle pool, each script's id and
-//! code page, and the server's logger. open.mp runs every script on its main thread and
+//! What the component keeps between native calls: the handle pool, the saver, each
+//! script's id and code page, and the server's logger. open.mp runs every script on its main thread and
 //! nothing else calls in here, so a thread-local is all the state needs.
 
 use crate::amx::{Amx, Cell};
 use pawn_json_core::dom::NodeId;
+use pawn_json_core::file::Saver;
 use pawn_json_core::pool::Pool;
 use pawn_json_core::text::Codepage;
 use std::cell::RefCell;
@@ -35,6 +36,7 @@ pub type KeyWalk = (u32, NodeId, u32, u32);
 
 pub struct State {
     pub pool: Pool,
+    pub saver: Saver,
     /// The `JSON_IterKey` loops in progress, keyed by script and key buffer address.
     pub key_walks: HashMap<(u32, Cell), KeyWalk>,
     scripts: HashMap<usize, Script>,
@@ -47,6 +49,7 @@ pub struct State {
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
         pool: Pool::default(),
+        saver: Saver::default(),
         key_walks: HashMap::new(),
         scripts: HashMap::new(),
         next_id: 1,
@@ -106,6 +109,16 @@ impl State {
         if let Some((ctx, log)) = self.logger {
             log(ctx, level as i32, msg.as_ptr(), msg.len());
         }
+    }
+
+    /// Logs each save that failed on the saver's thread since the last call, and says
+    /// whether there was one.
+    pub fn report_failed_saves(&self) -> bool {
+        let failures = self.saver.take_failures();
+        for why in &failures {
+            self.log(Level::Warning, &format!("JSON_SaveFile: {why}"));
+        }
+        !failures.is_empty()
     }
 
     /// Logs that the pool has run out of handles, but only the first time. That means the

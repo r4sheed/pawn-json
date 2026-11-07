@@ -18,6 +18,8 @@ struct PjApi
 	void (*script_unloaded)(AMX* amx);
 	bool (*set_codepage)(const char* label, size_t len);
 	void (*set_logger)(void* ctx, void (*log)(void* ctx, int level, const char* msg, size_t len));
+	void (*tick)();
+	void (*shutdown)();
 };
 
 namespace
@@ -30,7 +32,7 @@ void logLine(void* ctx, int level, const char* msg, size_t len)
 	static_cast<ICore*>(ctx)->logLn(static_cast<LogLevel>(level), "[pawn-json] %.*s", static_cast<int>(len), msg);
 }
 
-class JsonComponent final : public IComponent, public PawnEventHandler
+class JsonComponent final : public IComponent, public PawnEventHandler, public CoreEventHandler
 {
 	const PjApi& api_;
 	ICore* core_ = nullptr;
@@ -66,6 +68,9 @@ public:
 	{
 		core_ = core;
 		api_.set_logger(core, &logLine);
+		// Saves finish on a thread of their own, and a failure there is logged from the
+		// main thread on the next tick.
+		core->getEventDispatcher().addEventHandler(this);
 		StringView codepage = core->getConfig().getString("json.codepage");
 		if (!api_.set_codepage(codepage.data(), codepage.length()))
 		{
@@ -99,6 +104,11 @@ public:
 		api_.script_unloaded(script.GetAMX());
 	}
 
+	void onTick(Microseconds elapsed, TimePoint now) override
+	{
+		api_.tick();
+	}
+
 	void onFree(IComponent* component) override
 	{
 		if (component == pawn_)
@@ -109,9 +119,15 @@ public:
 
 	void free() override
 	{
+		// Every save the scripts made reaches the disk before the server goes.
+		api_.shutdown();
 		if (pawn_)
 		{
 			pawn_->getEventDispatcher().removeEventHandler(this);
+		}
+		if (core_)
+		{
+			core_->getEventDispatcher().removeEventHandler(this);
 		}
 		delete this;
 	}
