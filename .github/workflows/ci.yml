@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: rustup target add i686-pc-windows-msvc
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test --workspace --exclude jsonbench --target i686-pc-windows-msvc
+      - run: cargo build --release --target i686-pc-windows-msvc -p pawn-json
+      - run: python tools/exports.py target/i686-pc-windows-msvc/release/pawn_json.dll
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
+      - run: rustup target add i686-unknown-linux-gnu
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude jsonbench --target i686-unknown-linux-gnu
+      - run: cargo build --release --target i686-unknown-linux-gnu -p pawn-json
+      - run: python3 tools/exports.py target/i686-unknown-linux-gnu/release/libpawn_json.so

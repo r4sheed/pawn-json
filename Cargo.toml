@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/core", "crates/component", "bench"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MPL-2.0"
+authors = ["rasheed"]
+repository = "https://github.com/r4sheed/pawn-json"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

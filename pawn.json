@@ -1,0 +1,25 @@
+{
+    "user": "r4sheed",
+    "repo": "pawn-json",
+    "include_path": "include",
+    "resources": [
+        {
+            "name": "^pawn-json-(.*)-win32.zip$",
+            "platform": "windows",
+            "archive": true,
+            "includes": ["include"],
+            "files": {
+                "components/pawn-json.dll": "components/pawn-json.dll"
+            }
+        },
+        {
+            "name": "^pawn-json-(.*)-linux.tar.gz$",
+            "platform": "linux",
+            "archive": true,
+            "includes": ["include"],
+            "files": {
+                "components/pawn-json.so": "components/pawn-json.so"
+            }
+        }
+    ]
+}

@@ -1,0 +1,6 @@
+/target/
+/bench/target*/
+/target-po/
+/test-server/
+/tools/pawncc/
+/.local/

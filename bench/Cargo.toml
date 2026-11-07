@@ -1,0 +1,17 @@
+[package]
+name = "jsonbench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pawn-json-core = { path = "../crates/core" }
+serde = "1"
+serde_json = "1"
+encoding_rs = "0.8"
+indexmap = "2"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+mimalloc = { version = "0.1", default-features = false }
+rustc-hash = "2"
+
+[features]
+po = ["serde_json/preserve_order"]

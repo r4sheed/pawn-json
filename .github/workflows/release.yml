@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            built: pawn_json.dll
+            library: pawn-json.dll
+            archive: win32.zip
+            python: python
+          - os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            built: libpawn_json.so
+            library: pawn-json.so
+            archive: linux.tar.gz
+            python: python3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
+      - run: rustup target add ${{ matrix.target }}
+      - name: The tag is the crate's version
+        shell: bash
+        run: test "${GITHUB_REF_NAME#v}" = "$(cargo pkgid -p pawn-json | sed 's/.*[@#]//')"
+      - run: cargo test --workspace --exclude jsonbench --target ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} -p pawn-json
+      - run: ${{ matrix.python }} tools/exports.py target/${{ matrix.target }}/release/${{ matrix.built }}
+      - name: Package components/ and include/
+        shell: bash
+        run: |
+          mkdir -p dist/components dist/include
+          cp target/${{ matrix.target }}/release/${{ matrix.built }} dist/components/${{ matrix.library }}
+          cp target/${{ matrix.target }}/release/${{ matrix.built }} ${{ matrix.library }}
+          cp include/*.inc dist/include/
+          name=pawn-json-${GITHUB_REF_NAME#v}-${{ matrix.archive }}
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd dist && 7z a "../$name" components include)
+          else
+            tar -czf "$name" -C dist components include
+          fi
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE }}
+            ${{ matrix.library }}
