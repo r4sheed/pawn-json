@@ -136,6 +136,13 @@ native JSON_GetBool(Node:node, const key[], &bool:value);
 native JSON_GetString(Node:node, const key[], output[], size = sizeof (output));
 native JSON_GetNode(Node:node, const key[], &Node:child);
 
+// Reading a child into a variable that already holds one of your nodes replaces it. A
+// child from an earlier read is moved to the new one, so reading in a loop uses a single
+// handle, and anything else the variable held is released, unless you kept it. The
+// same goes for JSON_PathGetNode, JSON_ArrayGetNode, JSON_Parse and JSON_ParseFile. So a
+// copy of the handle in another variable stops working: JSON_Keep the node to hold on
+// to it.
+
 // The type stored under `key`, or of the node itself if `key` is empty. A missing key
 // or a freed node gives JSON_MISSING.
 native JSON_TypeOf(Node:node, const key[] = "");
@@ -252,11 +259,20 @@ native JSON_GetAs(Node:node, const key[], kind, size, {Float, bool, Node, _}:...
 //         ...
 //     }
 //
-// The walk remembers where it is inside `row` itself. It starts when `row` is 0, which a
-// new variable is, and when there's nothing left it frees the handle and sets `row` back
-// to 0, ready for the next loop. If you `break` out early, the walk stays where it was;
-// call JSON_Release(row) to end it there. Works on an array's elements or an object's
-// values.
+// The plugin keeps the loop's place for the variable `row`. A loop starts when `row`
+// holds anything but the element it last handed out - 0, as a new variable does - and
+// when there's nothing left it frees the element and sets `row` back to 0. It goes as
+// far as the length the container had when it began, so adding to the container inside
+// the loop can't make it endless. Releasing `row`, or a copy of it going out of scope,
+// doesn't send the loop back to the start.
+//
+// An inner loop may reuse the outer loop's variable: when it ends, `row` holds the outer
+// element again and the outer loop carries on. That is also why a loop left with
+// `break` keeps its place, and stepping it again carries on from there; set `row` to
+// Node:0 after the break if the next loop should be a new one.
+//
+// Works on an array's elements or an object's values. A container can't be walked into
+// its own variable: JSON_Iter(list, list) returns false and leaves `list` alone.
 native bool:JSON_Iter(Node:container, &Node:element);
 
 // An object's keys, in file order. This starts when `key` is empty, as a new array is,

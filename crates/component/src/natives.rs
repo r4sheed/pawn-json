@@ -60,6 +60,7 @@ pub(crate) fn run(
 extern "C" fn json_parse(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 2, |c, st| {
         let text = c.args.string(0).ok_or(Error::Address)?;
+        let held = c.args.read(1).ok_or(Error::Address)?;
         let (code, node) = match api::parse_doc(text, c.cp) {
             Ok(doc) => match st.pool.root(doc, c.owner) {
                 0 => {
@@ -77,6 +78,7 @@ extern "C" fn json_parse(amx: *mut Amx, params: *const Cell) -> Cell {
             st.pool.release(node);
             return Err(Error::Address);
         }
+        api::overwrite(&mut st.pool, c.owner, held);
         Ok(code)
     })
 }
@@ -101,7 +103,11 @@ extern "C" fn json_free(amx: *mut Amx, params: *const Cell) -> Cell {
         let len = usize::try_from(c.args.cell(1)).map_err(|_| Error::Address)?;
         let handles = c.args.cells(0, len).ok_or(Error::Address)?;
         let scope = c.args.data_cell(c.args.frame()).ok_or(Error::Address)?;
-        Ok(lifetime::free_scope(&mut st.pool, c.owner.script, scope, handles) as Cell)
+        let freed = lifetime::free_scope(&mut st.pool, c.owner.script, scope, handles);
+        // The loops these variables ran die with them.
+        st.walks
+            .forget(&mut st.pool, c.owner.script, c.args.cell(0), len);
+        Ok(freed as Cell)
     })
 }
 
@@ -296,7 +302,7 @@ extern "C" fn json_copy(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `JSON_ParseFile(const path[], &Node:node)`
 extern "C" fn json_parse_file(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 2, |c, st| {
-        let mut node = 0;
+        let mut node = c.args.read(1).ok_or(Error::Address)?;
         let (code, why) = api::parse_file(
             &mut st.pool,
             &st.saver,
@@ -389,7 +395,7 @@ extern "C" fn json_get_string(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `JSON_GetNode(Node:node, const key[], &Node:child)`
 extern "C" fn json_get_node(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 3, |c, st| {
-        let mut child = 0;
+        let mut child = c.args.read(2).ok_or(Error::Address)?;
         let code = api::get_node(
             &mut st.pool,
             c.cp,
@@ -610,7 +616,7 @@ extern "C" fn json_path_get_string(amx: *mut Amx, params: *const Cell) -> Cell {
 /// `JSON_PathGetNode(Node:node, const path[], &Node:child)`
 extern "C" fn json_path_get_node(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 3, |c, st| {
-        let mut child = 0;
+        let mut child = c.args.read(2).ok_or(Error::Address)?;
         let code = api::path_node(
             &mut st.pool,
             c.cp,
@@ -644,7 +650,7 @@ extern "C" fn json_array_get_string(amx: *mut Amx, params: *const Cell) -> Cell 
 /// view into the array, not a copy.
 extern "C" fn json_array_get_node(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 3, |c, st| {
-        let mut el = 0;
+        let mut el = c.args.read(2).ok_or(Error::Address)?;
         let code = api::element_node(
             &mut st.pool,
             c.owner,
@@ -770,7 +776,14 @@ extern "C" fn json_get_as(amx: *mut Amx, params: *const Cell) -> Cell {
 extern "C" fn json_iter(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 2, |c, st| {
         let mut el = c.args.read(1).ok_or(Error::Address)?;
-        let more = api::iter(&mut st.pool, c.owner, c.args.cell(0), &mut el);
+        let more = api::iter(
+            &mut st.pool,
+            &mut st.walks,
+            c.owner,
+            c.args.cell(1),
+            c.args.cell(0),
+            &mut el,
+        );
         put(c, 1, el)?;
         Ok(more as Cell)
     })
@@ -781,7 +794,16 @@ extern "C" fn json_iter_entry(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 4, |c, st| {
         let mut el = c.args.read(2).ok_or(Error::Address)?;
         let more = with_buffer(c, None, 1, 3, |_, out| {
-            api::iter_entry(&mut st.pool, c.cp, c.owner, c.args.cell(0), out, &mut el) as Cell
+            api::iter_entry(
+                &mut st.pool,
+                &mut st.walks,
+                c.cp,
+                c.owner,
+                c.args.cell(2),
+                c.args.cell(0),
+                out,
+                &mut el,
+            ) as Cell
         })?;
         put(c, 2, el)?;
         Ok(more)
@@ -802,18 +824,24 @@ extern "C" fn json_iter_key(amx: *mut Amx, params: *const Cell) -> Cell {
         let key = st.pool.resolve(c.args.cell(0)).and_then(|r| {
             let doc = st.pool.doc(r.doc);
             let generation = doc.generation(r.node);
-            let at = match st.key_walks.get(&slot) {
-                Some(&(d, node, g, i)) if !fresh && (d, node, g) == (r.doc, r.node, generation) => {
-                    i + 1
-                }
-                _ => 0,
+            let pawn_json_core::dom::Val::Obj(m) = doc.val(r.node) else {
+                return None;
             };
-            match doc.val(r.node) {
-                pawn_json_core::dom::Val::Obj(m) => m
-                    .get_index(at as usize)
-                    .map(|(k, _)| (k.clone(), (r.doc, r.node, generation, at))),
-                _ => None,
+            // As with JSON_Iter, the walk stops at the key count it began with, so a loop
+            // that adds keys still ends.
+            let (at, end) = match st.key_walks.get(&slot) {
+                Some(&(d, node, g, i, end))
+                    if !fresh && (d, node, g) == (r.doc, r.node, generation) =>
+                {
+                    (i + 1, end)
+                }
+                _ => (0, m.len() as u32),
+            };
+            if at >= end {
+                return None;
             }
+            m.get_index(at as usize)
+                .map(|(k, _)| (k.clone(), (r.doc, r.node, generation, at, end)))
         });
         match key {
             Some((k, walk)) => {

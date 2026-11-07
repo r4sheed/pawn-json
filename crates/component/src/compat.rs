@@ -142,7 +142,8 @@ fn made(c: &Call, st: &mut State, doc: Doc, taken: &[Cell]) -> Cell {
 }
 
 /// Writes a view of `id` into the output argument `out`. If `out` already holds a view
-/// the script hasn't kept, that handle is re-pointed rather than a new one made.
+/// the script hasn't kept, that handle is re-pointed rather than a new one made; any
+/// other node it held is replaced, as `api::overwrite` says.
 fn view_into(c: &Call, st: &mut State, out: usize, d: u32, id: NodeId) -> Result<Cell, Error> {
     let held = c.args.read(out).ok_or(Error::Address)?;
     let h = st.pool.walk(held, d, id, c.owner);
@@ -152,6 +153,9 @@ fn view_into(c: &Call, st: &mut State, out: usize, d: u32, id: NodeId) -> Result
     }
     if !c.args.write(out, h) {
         return Err(Error::Address);
+    }
+    if h != held {
+        pawn_json_core::api::overwrite(&mut st.pool, c.owner, held);
     }
     Ok(OK)
 }

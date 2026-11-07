@@ -25,13 +25,6 @@ pub struct Ref {
     pub node: NodeId,
 }
 
-/// How far a `JSON_Iter` walk has got: the container it is walking and the index it is at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Walk {
-    pub container: NodeId,
-    pub index: u32,
-}
-
 struct Live {
     doc: u32,
     node: NodeId,
@@ -39,7 +32,6 @@ struct Live {
     owner: Owner,
     kept: bool,
     view: bool,
-    walk: Option<Walk>,
 }
 
 struct Slot {
@@ -169,7 +161,6 @@ impl Pool {
             owner,
             kept: false,
             view: false,
-            walk: None,
         });
         if h == 0 {
             self.docs[d as usize] = None;
@@ -189,37 +180,7 @@ impl Pool {
             owner,
             kept: false,
             view: true,
-            walk: None,
         })
-    }
-
-    /// One step of a walk. If `el` is a view the script has not kept, it is re-pointed at
-    /// `node`; otherwise a new view is made, so an element the script kept is never taken
-    /// away from it.
-    pub fn walk(&mut self, el: Cell, doc: u32, node: NodeId, owner: Owner) -> Cell {
-        self.walk_with(el, doc, node, owner, None)
-    }
-
-    /// Like `walk`, but also records the walk's position in the handle it returns.
-    pub fn walk_with(
-        &mut self,
-        el: Cell,
-        doc: u32,
-        node: NodeId,
-        owner: Owner,
-        walk: Option<Walk>,
-    ) -> Cell {
-        let h = self.walk_without_position(el, doc, node, owner);
-        if let Some(l) = self.slot_mut(h) {
-            l.walk = walk;
-        }
-        h
-    }
-
-    /// The walk position stored in `h`, along with the document being walked.
-    pub fn walk_state(&self, h: Cell) -> Option<(u32, Walk)> {
-        let l = self.slot(h)?;
-        Some((l.doc, l.walk?))
     }
 
     /// Whether `h` is a view the script has not kept, which a walk is free to re-point or
@@ -228,10 +189,13 @@ impl Pool {
         self.slot(h).is_some_and(|l| l.view && !l.kept)
     }
 
-    fn walk_without_position(&mut self, el: Cell, doc: u32, node: NodeId, owner: Owner) -> Cell {
+    /// One step of a walk. If `el` is a view this script made and has not kept, it is
+    /// re-pointed at `node`; otherwise a new view is made, so a kept element, or another
+    /// script's, is never taken away from its holder.
+    pub fn walk(&mut self, el: Cell, doc: u32, node: NodeId, owner: Owner) -> Cell {
         let node_generation = self.doc(doc).generation(node);
         let old_doc = match self.slot_mut(el) {
-            Some(l) if l.view && !l.kept => {
+            Some(l) if l.view && !l.kept && l.owner.script == owner.script => {
                 let old = l.doc;
                 *l = Live {
                     doc,
@@ -240,7 +204,6 @@ impl Pool {
                     owner,
                     kept: false,
                     view: true,
-                    walk: None,
                 };
                 old
             }

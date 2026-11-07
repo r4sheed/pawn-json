@@ -10,9 +10,10 @@
 use crate::dom::{Doc, NodeId, Val};
 use crate::error::{Error, OK, Type, code};
 use crate::file::Saver;
-use crate::pool::{Cell, Owner, Pool, Walk};
+use crate::pool::{Cell, Owner, Pool};
 use crate::text::{self, Codepage};
 use crate::write;
+use std::collections::HashMap;
 
 fn found(pool: &Pool, h: Cell) -> Result<(u32, NodeId), Error> {
     let r = pool.resolve(h).ok_or(Error::Node)?;
@@ -99,15 +100,28 @@ pub fn parse_doc(input: &[Cell], cp: Codepage) -> Result<Doc, crate::dom::ParseE
     Doc::parse(&text::to_string(input, cp))
 }
 
-/// `JSON_Parse(const text[], &Node:out)`. `out` is left at 0 if anything fails.
+/// `JSON_Parse(const text[], &Node:out)`. `out` comes in holding what the variable held,
+/// which the new node replaces (see `overwrite`), and is left at 0 if anything fails.
 pub fn parse(pool: &mut Pool, cp: Codepage, owner: Owner, input: &[Cell], out: &mut Cell) -> Cell {
-    *out = 0;
-    match parse_doc(input, cp) {
+    let old = std::mem::take(out);
+    let code = match parse_doc(input, cp) {
         Ok(doc) => {
             *out = pool.root(doc, owner);
             if *out == 0 { Error::Node as Cell } else { OK }
         }
         Err(_) => Error::Syntax as Cell,
+    };
+    overwrite(pool, owner, old);
+    code
+}
+
+/// A node written into a variable replaces what the variable held. If that was a handle
+/// of the same script that nothing keeps, it is released, so a variable that is parsed
+/// or read into over and over doesn't leave a node behind each time. A copy of the old
+/// handle in another variable stops working, which is why kept handles are left alone.
+pub fn overwrite(pool: &mut Pool, owner: Owner, old: Cell) {
+    if pool.owner(old).is_some_and(|o| o.script == owner.script) && !pool.kept(old) {
+        pool.release(old);
     }
 }
 
@@ -142,10 +156,18 @@ pub fn get_node(
     code(member(pool, cp, node, key).and_then(|(d, id)| view(pool, owner, d, id, out)))
 }
 
+/// Hands out a view of `id` in `out`, which comes in holding what the variable held. A
+/// view this script made and didn't keep is re-pointed, as a walk's element is; anything
+/// else the variable held is replaced as `overwrite` says. So a read into the same
+/// variable in a loop uses one handle, not one per pass.
 fn view(pool: &mut Pool, owner: Owner, d: u32, id: NodeId, out: &mut Cell) -> Result<(), Error> {
-    match pool.view(d, id, owner) {
+    let old = *out;
+    match pool.walk(old, d, id, owner) {
         0 => Err(Error::Node),
         h => {
+            if h != old {
+                overwrite(pool, owner, old);
+            }
             *out = h;
             Ok(())
         }
@@ -512,10 +534,10 @@ pub fn parse_file(
     path: &[Cell],
     out: &mut Cell,
 ) -> (Cell, Option<String>) {
-    *out = 0;
+    let old = std::mem::take(out);
     saver.flush();
     let path = text::to_string(path, cp);
-    match crate::file::load(&path) {
+    let result = match crate::file::load(&path) {
         Ok(doc) => match pool.root(doc, owner) {
             0 => (Error::Node as Cell, None),
             h => {
@@ -528,7 +550,9 @@ pub fn parse_file(
             Error::Syntax as Cell,
             Some(format!("{path}: {}", e.message)),
         ),
-    }
+    };
+    overwrite(pool, owner, old);
+    result
 }
 
 /// `JSON_SaveFile(Node:node, const path[], bool:pretty)`. Returns once the text is in a
@@ -598,92 +622,250 @@ pub fn pack<A: crate::format::Args>(
     })
 }
 
-// Iteration, as in `while (JSON_Iter(list, row))`. The walk's position is stored in the
-// element's handle, so the script has no index to keep. A walk starts from the top
-// whenever the element variable does not hold a walk of this container, which a new
-// variable (still 0) never does. When the walk runs out, the element handle is released
-// and the variable set back to 0, ready for the next walk.
+// Iteration, as in `while (JSON_Iter(list, row))`. A loop's position belongs to its
+// element variable: the plugin keeps it, keyed by the script and the variable's address,
+// so the script has no index to keep, and nothing done to the node in the variable -
+// releasing it, or a copy of it going out of scope - can send the loop back to the
+// start. A loop carries on while the variable still holds what the loop last put in it;
+// anything else, such as the 0 of a new variable, starts a new loop. When a loop runs
+// out, its element is released and the variable set back to 0.
+//
+// A loop goes as far as the container's length when it began. What it adds on the way
+// isn't visited, so a loop that appends to its own array still ends; what it removes
+// ends it early.
+//
+// A loop inside another that reuses the outer loop's variable is stacked on top of it.
+// When the inner loop runs out, or the outer one is stepped again after a `break`, the
+// variable holds the outer loop's element again and the outer loop carries on.
 
-fn index_after(pool: &Pool, el: Cell, doc: u32, container: NodeId) -> usize {
-    match pool.walk_state(el) {
-        Some((d, w)) if d == doc && w.container == container => w.index as usize + 1,
-        _ => 0,
-    }
+/// The loops in progress, keyed by script and element variable. Each variable has a stack,
+/// innermost loop last.
+#[derive(Default)]
+pub struct Walks {
+    loops: HashMap<(u32, Cell), Vec<Walk>>,
 }
 
-fn end_walk(pool: &mut Pool, el: &mut Cell) -> bool {
-    if pool.is_unkept_view(*el) {
-        pool.release(*el);
-    }
-    *el = 0;
-    false
-}
-
-fn step_to(
-    pool: &mut Pool,
-    owner: Owner,
+#[derive(Clone, Copy)]
+struct Walk {
+    /// What the loop last put in the variable.
+    handle: Cell,
     doc: u32,
     container: NodeId,
-    at: usize,
-    id: NodeId,
-    el: &mut Cell,
-) -> bool {
-    let walk = Walk {
-        container,
-        index: at as u32,
-    };
-    match pool.walk_with(*el, doc, id, owner, Some(walk)) {
-        0 => false,
-        h => {
-            *el = h;
-            true
+    generation: u32,
+    /// The index of that element, and where the loop stops.
+    index: u32,
+    end: u32,
+}
+
+impl Walks {
+    /// Forgets the loops of the variables in `cells` cells from address `at`, the
+    /// variables of a scope that is ending, and releases the elements the loops made.
+    pub fn forget(&mut self, pool: &mut Pool, script: u32, at: Cell, cells: usize) {
+        if self.loops.is_empty() {
+            return;
         }
+        let end = at as i64 + (cells * size_of::<Cell>()) as i64;
+        self.loops.retain(|&(s, var), stack| {
+            let gone = s == script && (at as i64..end).contains(&(var as i64));
+            if gone {
+                for w in stack.drain(..) {
+                    release_element(pool, script, w.handle);
+                }
+            }
+            !gone
+        });
+    }
+
+    /// Forgets every loop of a script that is unloading. Its handles go with it.
+    pub fn forget_script(&mut self, script: u32) {
+        self.loops.retain(|&(s, _), _| s != script);
+    }
+
+    /// How many loops are in progress.
+    pub fn len(&self) -> usize {
+        self.loops.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.loops.is_empty()
+    }
+}
+
+/// Releases an element a loop made, unless the script kept it or it isn't the script's.
+fn release_element(pool: &mut Pool, script: u32, h: Cell) {
+    if pool.is_unkept_view(h) && pool.owner(h).is_some_and(|o| o.script == script) {
+        pool.release(h);
+    }
+}
+
+/// One step of the loop over `container` whose element variable is at address `var` and
+/// holds `el`. Returns the index and node of the next element, now in `el`, or `None`
+/// once the loop is done. `objects_only` is for `JSON_IterEntry`.
+fn advance(
+    pool: &mut Pool,
+    walks: &mut Walks,
+    owner: Owner,
+    var: Cell,
+    container: Cell,
+    el: &mut Cell,
+    objects_only: bool,
+) -> Option<(usize, NodeId)> {
+    let key = (owner.script, var);
+    let holds_top = walks
+        .loops
+        .get(&key)
+        .and_then(|s| s.last())
+        .is_some_and(|w| w.handle == *el);
+    // Walking a container into the variable that holds it would lose the container on
+    // the first step, so that is refused and the variable left alone. When the variable
+    // holds an outer loop's element, the inner loop gets a handle of its own and the
+    // element stays, so walking it is fine.
+    if container == *el && container != 0 && !holds_top {
+        return None;
+    }
+    let Ok((d, node)) = found(pool, container) else {
+        // The container is gone. If the variable holds what its loop last put there,
+        // that loop is over.
+        if holds_top {
+            finish(pool, walks, key, el);
+        }
+        return None;
+    };
+    let generation = pool.doc(d).generation(node);
+    let len = match pool.doc(d).val(node) {
+        Val::Obj(m) => m.len(),
+        Val::Arr(v) if !objects_only => v.len(),
+        _ => 0,
+    };
+    let stack = walks.loops.entry(key).or_default();
+    let this = |w: &Walk| (w.doc, w.container, w.generation) == (d, node, generation);
+    let mut fresh_view = false;
+    match stack.iter().rposition(this) {
+        Some(k) if holds_top => {
+            // This loop is under way. Loops stacked on it were left with `break`.
+            if k + 1 < stack.len() {
+                for w in stack.drain(k + 1..) {
+                    release_element(pool, owner.script, w.handle);
+                }
+                *el = stack[k].handle;
+            }
+        }
+        _ => {
+            if holds_top {
+                // A loop inside another, on the outer loop's variable: the outer
+                // element stays as it is, for when this loop is done.
+                fresh_view = true;
+            } else {
+                // The variable holds something else, so any loop it had is over.
+                for w in stack.drain(..) {
+                    if w.handle != *el {
+                        release_element(pool, owner.script, w.handle);
+                    }
+                }
+            }
+            stack.push(Walk {
+                handle: 0,
+                doc: d,
+                container: node,
+                generation,
+                index: u32::MAX,
+                end: len as u32,
+            });
+        }
+    }
+    let w = *stack.last().expect("a loop was just found or pushed");
+    let at = w.index.wrapping_add(1);
+    if at >= w.end || at as usize >= len {
+        finish(pool, walks, key, el);
+        return None;
+    }
+    let id = match pool.doc(d).val(node) {
+        Val::Arr(v) => v[at as usize],
+        Val::Obj(m) => {
+            *m.get_index(at as usize)
+                .expect("an index below the length")
+                .1
+        }
+        _ => unreachable!("only a container has a length"),
+    };
+    let old = *el;
+    let h = if fresh_view {
+        pool.view(d, id, owner)
+    } else {
+        pool.walk(old, d, id, owner)
+    };
+    if h == 0 {
+        finish(pool, walks, key, el);
+        return None;
+    }
+    if h != old && !fresh_view {
+        overwrite(pool, owner, old);
+    }
+    *el = h;
+    let top = walks
+        .loops
+        .get_mut(&key)
+        .and_then(|s| s.last_mut())
+        .expect("the loop is still there");
+    top.handle = h;
+    top.index = at;
+    Some((at as usize, id))
+}
+
+/// Ends the innermost loop of a variable: its element is released, and the variable
+/// gets back the element of the loop under it, or 0.
+fn finish(pool: &mut Pool, walks: &mut Walks, key: (u32, Cell), el: &mut Cell) {
+    let Some(stack) = walks.loops.get_mut(&key) else {
+        *el = 0;
+        return;
+    };
+    if let Some(w) = stack.pop()
+        && w.handle != 0
+    {
+        release_element(pool, key.0, w.handle);
+    }
+    *el = stack.last().map_or(0, |w| w.handle);
+    if stack.is_empty() {
+        walks.loops.remove(&key);
     }
 }
 
 /// `JSON_Iter(Node:container, &Node:element)`. Steps to the next element of an array or
-/// the next value of an object, and returns false once there are no more.
-pub fn iter(pool: &mut Pool, owner: Owner, container: Cell, el: &mut Cell) -> bool {
-    let Ok((d, node)) = found(pool, container) else {
-        return end_walk(pool, el);
-    };
-    let at = index_after(pool, *el, d, node);
-    let id = match pool.doc(d).val(node) {
-        Val::Arr(v) => v.get(at).copied(),
-        Val::Obj(m) => m.get_index(at).map(|(_, &id)| id),
-        _ => None,
-    };
-    match id {
-        Some(id) => step_to(pool, owner, d, node, at, id, el),
-        None => end_walk(pool, el),
-    }
+/// the next value of an object, and returns false once there are no more. `var` is the
+/// address of the element variable.
+pub fn iter(
+    pool: &mut Pool,
+    walks: &mut Walks,
+    owner: Owner,
+    var: Cell,
+    container: Cell,
+    el: &mut Cell,
+) -> bool {
+    advance(pool, walks, owner, var, container, el, false).is_some()
 }
 
 /// `JSON_IterEntry(Node:object, key[], &Node:value, size)`. Steps to the next key and its
 /// value. A key longer than the buffer is cut to fit, and the walk carries on.
+#[allow(clippy::too_many_arguments)]
 pub fn iter_entry(
     pool: &mut Pool,
+    walks: &mut Walks,
     cp: Codepage,
     owner: Owner,
+    var: Cell,
     obj: Cell,
     key: &mut [Cell],
     el: &mut Cell,
 ) -> bool {
-    let Ok((d, node)) = found(pool, obj) else {
-        return end_walk(pool, el);
+    let Some((at, _)) = advance(pool, walks, owner, var, obj, el, true) else {
+        return false;
     };
-    let at = index_after(pool, *el, d, node);
-    let id = match pool.doc(d).val(node) {
-        Val::Obj(m) => m.get_index(at).map(|(k, &id)| {
-            let _ = text::put(key, k, cp);
-            id
-        }),
-        _ => None,
-    };
-    match id {
-        Some(id) => step_to(pool, owner, d, node, at, id, el),
-        None => end_walk(pool, el),
+    let (d, node) = found(pool, obj).expect("the object was just walked");
+    if let Val::Obj(m) = pool.doc(d).val(node) {
+        let (k, _) = m.get_index(at).expect("an index below the length");
+        let _ = text::put(key, k, cp);
     }
+    true
 }
 
 // Writing JSON text.
@@ -712,6 +894,19 @@ mod tests {
 
     fn back(cells: &[Cell]) -> String {
         text::to_string(cells, Codepage::DEFAULT)
+    }
+
+    /// The address of a test's element variable. As in Pawn, each loop variable has its
+    /// own.
+    fn var(name: &str) -> Cell {
+        match name {
+            "row" => 400,
+            "cell" => 404,
+            "val" => 408,
+            "el" => 412,
+            "list" => 416,
+            _ => panic!("no address for {name}"),
+        }
     }
 
     fn root(pool: &mut Pool, json: &str) -> Cell {
@@ -1069,6 +1264,141 @@ mod tests {
         assert!(why.unwrap().contains("api.json.none"));
     }
 
+    // The mistakes a script makes most, held to what they must do: nothing piles up, and
+    // nothing runs forever.
+
+    #[test]
+    fn parsing_into_one_variable_over_and_over_keeps_one_document() {
+        let mut pool = Pool::default();
+        let mut n = 0;
+        for _ in 0..1000 {
+            assert_eq!(parse(&mut pool, CP, ME, &s("{\"a\":[1,2,3]}"), &mut n), OK);
+        }
+        assert_eq!(pool.live_handles(), 1);
+        // A failed parse empties the variable, and what it held goes too.
+        assert_eq!(
+            parse(&mut pool, CP, ME, &s("{"), &mut n),
+            Error::Syntax as Cell
+        );
+        assert_eq!((n, pool.live_handles()), (0, 0));
+    }
+
+    #[test]
+    fn reading_children_into_one_variable_keeps_one_handle() {
+        let mut pool = Pool::default();
+        let r = root(
+            &mut pool,
+            r#"{"list":[{"pos":[1]},{"pos":[2]}],"a":{"b":{}}}"#,
+        );
+        let mut v = 0;
+        for i in 0..500 {
+            assert_eq!(get_node(&mut pool, CP, ME, r, &s("a"), &mut v), OK);
+            assert_eq!(path_node(&mut pool, CP, ME, r, &s("/a/b"), &mut v), OK);
+            let mut list = 0;
+            assert_eq!(get_node(&mut pool, CP, ME, r, &s("list"), &mut list), OK);
+            assert_eq!(element_node(&mut pool, ME, list, i % 2, &mut v), OK);
+            pool.release(list);
+        }
+        assert_eq!(pool.live_handles(), 2);
+        // Reading a child into the variable that holds its parent: the parent's handle
+        // goes, and the document stays for the child.
+        let mut p = root(&mut pool, r#"{"c":{"x":7}}"#);
+        assert_eq!(get_node(&mut pool, CP, ME, p, &s("c"), &mut p), OK);
+        let mut x = 0;
+        assert_eq!(get_int(&pool, CP, p, &s("x"), &mut x), OK);
+        assert_eq!((x, pool.live_handles()), (7, 3));
+    }
+
+    #[test]
+    fn a_kept_handle_or_another_script_s_is_never_taken_from_a_variable() {
+        let mut pool = Pool::default();
+        let other = Owner {
+            script: 2,
+            frame: 100,
+        };
+        let r = root(&mut pool, r#"{"a":1,"b":2}"#);
+        let mut kept = 0;
+        get_node(&mut pool, CP, ME, r, &s("a"), &mut kept);
+        pool.set_kept(kept, true);
+        let mut v = kept;
+        assert_eq!(get_node(&mut pool, CP, ME, r, &s("b"), &mut v), OK);
+        assert_ne!(v, kept);
+        assert_eq!(dump(&pool, kept), "1");
+        let mut theirs = 0;
+        get_node(&mut pool, CP, other, r, &s("a"), &mut theirs);
+        let mut mine = theirs;
+        assert_eq!(get_node(&mut pool, CP, ME, r, &s("b"), &mut mine), OK);
+        assert_ne!(mine, theirs);
+        assert_eq!(dump(&pool, theirs), "1");
+        let mut parsed = theirs;
+        assert_eq!(parse(&mut pool, CP, ME, &s("[]"), &mut parsed), OK);
+        assert_eq!(dump(&pool, theirs), "1");
+    }
+
+    #[test]
+    fn a_walk_ends_even_when_the_loop_adds_to_what_it_walks() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let list = root(&mut pool, "[1,2,3]");
+        let (mut el, mut steps) = (0, 0);
+        while iter(&mut pool, &mut walks, ME, var("el"), list, &mut el) {
+            append(&mut pool, list, int_val(0));
+            steps += 1;
+            assert!(steps <= 3, "the walk did not stop");
+        }
+        assert_eq!(steps, 3);
+        let obj = root(&mut pool, r#"{"a":1}"#);
+        let (mut el, mut steps) = (0, 0);
+        while iter(&mut pool, &mut walks, ME, var("el"), obj, &mut el) {
+            set(&mut pool, CP, obj, &s(&format!("k{steps}")), int_val(0));
+            steps += 1;
+            assert!(steps <= 1, "the walk did not stop");
+        }
+        let mut key = [0; 8];
+        let (mut el, mut steps) = (0, 0);
+        while iter_entry(
+            &mut pool,
+            &mut walks,
+            CP,
+            ME,
+            var("el"),
+            obj,
+            &mut key,
+            &mut el,
+        ) {
+            set(&mut pool, CP, obj, &s(&format!("e{steps}")), int_val(0));
+            steps += 1;
+            assert!(steps <= 2, "the walk did not stop");
+        }
+        assert_eq!(steps, 2);
+        // A walk over an array that shrinks ends early instead of reading past it.
+        let list = root(&mut pool, "[1,2,3,4,5]");
+        let (mut el, mut steps) = (0, 0);
+        while iter(&mut pool, &mut walks, ME, var("el"), list, &mut el) {
+            array_remove(&mut pool, list, 0);
+            steps += 1;
+        }
+        assert_eq!(steps, 3);
+    }
+
+    #[test]
+    fn a_container_is_not_walked_into_its_own_variable() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let mut list = root(&mut pool, "[[1],[2]]");
+        let held = list;
+        assert!(!iter(
+            &mut pool,
+            &mut walks,
+            ME,
+            var("list"),
+            list,
+            &mut list
+        ));
+        assert_eq!(list, held);
+        assert_eq!(dump(&pool, list), "[[1],[2]]");
+    }
+
     /// A read straight after a save must see it, even when the thread has not got to it
     /// yet and even when the path is spelled differently.
     #[test]
@@ -1173,16 +1503,17 @@ mod tests {
     #[test]
     fn iter_walks_an_array_and_ends_clean() {
         let mut pool = Pool::default();
+        let mut walks = Walks::default();
         let a = root(&mut pool, "[10,20,30]");
         let (mut row, mut sum, mut v) = (0, 0, 0);
-        while iter(&mut pool, ME, a, &mut row) {
+        while iter(&mut pool, &mut walks, ME, var("row"), a, &mut row) {
             value_int(&pool, row, &mut v);
             sum = sum * 100 + v;
             assert_eq!(pool.live_handles(), 2, "one handle for the whole walk");
         }
         assert_eq!((sum, row, pool.live_handles()), (102030, 0, 1));
         let mut steps = 0;
-        while iter(&mut pool, ME, a, &mut row) {
+        while iter(&mut pool, &mut walks, ME, var("row"), a, &mut row) {
             steps += 1;
         }
         assert_eq!(steps, 3, "the same variable walks again from the start");
@@ -1191,26 +1522,31 @@ mod tests {
     #[test]
     fn iter_walks_an_object_s_values_and_an_empty_one_not_at_all() {
         let mut pool = Pool::default();
+        let mut walks = Walks::default();
         let o = root(&mut pool, r#"{"a":1,"b":2}"#);
         let (mut val, mut sum, mut v) = (0, 0, 0);
-        while iter(&mut pool, ME, o, &mut val) {
+        while iter(&mut pool, &mut walks, ME, var("val"), o, &mut val) {
             value_int(&pool, val, &mut v);
             sum += v;
         }
         assert_eq!(sum, 3);
         let e = root(&mut pool, "[]");
-        assert!(!iter(&mut pool, ME, e, &mut val));
-        assert!(!iter(&mut pool, ME, 0, &mut val), "no container, no walk");
+        assert!(!iter(&mut pool, &mut walks, ME, var("val"), e, &mut val));
+        assert!(
+            !iter(&mut pool, &mut walks, ME, var("val"), 0, &mut val),
+            "no container, no walk"
+        );
         let n = root(&mut pool, "5");
-        assert!(!iter(&mut pool, ME, n, &mut val));
+        assert!(!iter(&mut pool, &mut walks, ME, var("val"), n, &mut val));
     }
 
     #[test]
     fn a_kept_element_stays_and_the_walk_goes_on() {
         let mut pool = Pool::default();
+        let mut walks = Walks::default();
         let a = root(&mut pool, "[1,2,3]");
         let (mut row, mut kept, mut seen, mut v) = (0, 0, vec![], 0);
-        while iter(&mut pool, ME, a, &mut row) {
+        while iter(&mut pool, &mut walks, ME, var("row"), a, &mut row) {
             value_int(&pool, row, &mut v);
             seen.push(v);
             if v == 1 {
@@ -1227,10 +1563,11 @@ mod tests {
     #[test]
     fn iters_nest() {
         let mut pool = Pool::default();
+        let mut walks = Walks::default();
         let grid = root(&mut pool, "[[1,2],[3]]");
         let (mut row, mut cell, mut sum, mut v) = (0, 0, 0, 0);
-        while iter(&mut pool, ME, grid, &mut row) {
-            while iter(&mut pool, ME, row, &mut cell) {
+        while iter(&mut pool, &mut walks, ME, var("row"), grid, &mut row) {
+            while iter(&mut pool, &mut walks, ME, var("cell"), row, &mut cell) {
                 value_int(&pool, cell, &mut v);
                 sum += v;
             }
@@ -1239,11 +1576,116 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_goes_on_when_its_element_is_released() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let a = root(&mut pool, "[1,2,3]");
+        let (mut row, mut seen, mut v) = (0, vec![], 0);
+        while iter(&mut pool, &mut walks, ME, var("row"), a, &mut row) {
+            value_int(&pool, row, &mut v);
+            seen.push(v);
+            // As JSON_Release(row) does, or a copy of row in a block's own variable
+            // when the block ends.
+            pool.release(row);
+            assert!(seen.len() <= 3, "the loop started over");
+        }
+        assert_eq!(seen, [1, 2, 3]);
+        assert_eq!((row, pool.live_handles(), walks.len()), (0, 1, 0));
+    }
+
+    #[test]
+    fn nested_loops_can_share_one_variable() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let grid = root(
+            &mut pool,
+            r#"[{"n":10,"items":[1,2]},{"n":20,"items":[3]}]"#,
+        );
+        let (mut row, mut items, mut sum, mut v, mut outer) = (0, 0, 0, 0, 0);
+        while iter(&mut pool, &mut walks, ME, var("row"), grid, &mut row) {
+            outer += 1;
+            assert!(outer <= 2, "the outer loop started over");
+            get_node(&mut pool, CP, ME, row, &s("items"), &mut items);
+            while iter(&mut pool, &mut walks, ME, var("row"), items, &mut row) {
+                value_int(&pool, row, &mut v);
+                sum += v;
+            }
+            // Back on the outer element once the inner loop is done.
+            assert_eq!(get_int(&pool, CP, row, &s("n"), &mut v), OK);
+            sum += v;
+        }
+        assert_eq!((outer, sum, row, walks.len()), (2, 36, 0, 0));
+        pool.release(items);
+        assert_eq!(pool.live_handles(), 1);
+    }
+
+    #[test]
+    fn an_outer_loop_goes_on_after_a_break_from_the_inner_one() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let grid = root(&mut pool, "[[1,2,3],[4,5,6]]");
+        let (mut row, mut seen, mut v, mut outer) = (0, vec![], 0, 0);
+        while iter(&mut pool, &mut walks, ME, var("row"), grid, &mut row) {
+            outer += 1;
+            assert!(outer <= 2, "the outer loop started over");
+            let inner = row;
+            // The container is the outer element, which isn't in the variable while the
+            // inner loop runs; a copy of it is.
+            let mut first = true;
+            while iter(&mut pool, &mut walks, ME, var("row"), inner, &mut row) {
+                value_int(&pool, row, &mut v);
+                seen.push(v);
+                if !first {
+                    break;
+                }
+                first = false;
+            }
+        }
+        assert_eq!(seen, [1, 2, 4, 5]);
+        assert_eq!((row, walks.len(), pool.live_handles()), (0, 0, 1));
+    }
+
+    #[test]
+    fn the_end_of_a_scope_forgets_its_loops() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let grid = root(&mut pool, "[[1,2],[3,4]]");
+        let (mut row, mut cell) = (0, 0);
+        assert!(iter(&mut pool, &mut walks, ME, var("row"), grid, &mut row));
+        let inner = row;
+        assert!(iter(&mut pool, &mut walks, ME, var("row"), inner, &mut row));
+        assert!(iter(
+            &mut pool,
+            &mut walks,
+            ME,
+            var("cell"),
+            grid,
+            &mut cell
+        ));
+        assert_eq!((walks.len(), pool.live_handles()), (3, 4));
+        // A scope with only `cell` in it ends, then one with `row`.
+        walks.forget(&mut pool, ME.script, var("cell"), 1);
+        assert_eq!((walks.len(), pool.live_handles()), (2, 3));
+        walks.forget(&mut pool, ME.script, var("row") - 4, 2);
+        assert_eq!((walks.len(), pool.live_handles()), (0, 1));
+    }
+
+    #[test]
     fn iter_entry_hands_out_keys_in_order() {
         let mut pool = Pool::default();
+        let mut walks = Walks::default();
         let o = root(&mut pool, r#"{"zeta":1,"alpha":2}"#);
         let (mut val, mut key, mut keys) = (0, [0; 8], vec![]);
-        while iter_entry(&mut pool, CP, ME, o, &mut key, &mut val) {
+        while iter_entry(
+            &mut pool,
+            &mut walks,
+            CP,
+            ME,
+            var("val"),
+            o,
+            &mut key,
+            &mut val,
+        ) {
             keys.push(back(&key));
         }
         assert_eq!(keys, ["zeta", "alpha"]);

@@ -46,9 +46,23 @@ pub fn save_with(
     bytes: &[u8],
     write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
+    names_a_file(path)?;
     let tmp = format!("{path}.tmp");
     let file = begin(&tmp, bytes, write)?;
     finish(file, &tmp, path)
+}
+
+/// Refuses a path that can't name a file, empty or ending in a separator, before
+/// anything is written. Otherwise the temporary file would land beside it and the
+/// failure would only show once the rename was tried.
+fn names_a_file(path: &str) -> io::Result<()> {
+    if path.is_empty() || path.ends_with(['/', '\\']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path names a folder, not a file",
+        ));
+    }
+    Ok(())
 }
 
 /// Writes `bytes` into a new file at `tmp`, and removes it again if that fails.
@@ -132,6 +146,7 @@ impl Saver {
     /// An error writing the temporary file (a missing folder, no permission, a full disk)
     /// comes back here and nothing is queued.
     pub fn save(&mut self, doc: &Doc, node: NodeId, path: &str, pretty: bool) -> io::Result<()> {
+        names_a_file(path)?;
         let text = write::to_string(doc, node, pretty);
         self.made += 1;
         let tmp = format!("{path}.{}.tmp", self.made);
@@ -373,6 +388,22 @@ mod tests {
         assert!(save_text(&mut saver, &path, "[1]").is_err());
         saver.flush();
         assert!(saver.take_failures().is_empty());
+    }
+
+    #[test]
+    fn a_path_that_names_a_folder_fails_at_once() {
+        let dir = folder("saver-folder");
+        let mut saver = Saver::default();
+        let slash = format!("{}/", dir.to_string_lossy());
+        let backslash = format!("{}\\", dir.to_string_lossy());
+        for path in ["", slash.as_str(), backslash.as_str()] {
+            assert!(save_text(&mut saver, path, "[1]").is_err(), "{path:?}");
+        }
+        let doc = Doc::parse("[1]").unwrap();
+        assert!(save(&doc, doc.root(), "", false).is_err());
+        saver.flush();
+        assert!(saver.take_failures().is_empty());
+        assert!(temporaries(&dir).is_empty());
     }
 
     #[test]

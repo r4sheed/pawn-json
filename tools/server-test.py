@@ -62,10 +62,24 @@ def prepare_save():
         f.write("x")
 
 
+def prepare_mistakes():
+    # An empty file, which is not JSON.
+    open(os.path.join(SERVER, "scriptfiles", "empty.json"), "w").close()
+
+
 # What a test needs in place before its server starts.
 PREPARE = {
     "save": prepare_save,
+    "mistakes": prepare_mistakes,
 }
+
+
+def temporaries():
+    """The temporary files of saves that were never finished, anywhere in scriptfiles."""
+    found = []
+    for folder, _, files in os.walk(os.path.join(SERVER, "scriptfiles")):
+        found += [os.path.relpath(os.path.join(folder, f), SERVER) for f in files if f.endswith(".tmp")]
+    return found
 
 
 def option(name, env):
@@ -225,6 +239,12 @@ def main():
                 print("  " + l)
         status = "no PASS line" if result is None else f"PASS {result[0]} FAIL {result[1]}"
         print(f"{name}: {status}{', killed' if killed else ''}; {loaded[0].strip() if loaded else 'component not loaded'}")
+        left = temporaries()
+        if left:
+            print(f"  temporary files left behind: {', '.join(left)}")
+            result = None
+            for rel in left:
+                os.remove(os.path.join(SERVER, rel))
         for rel, want in checks:
             path = os.path.join(SERVER, rel)
             held = open(path, "rb").read() if os.path.exists(path) else b""

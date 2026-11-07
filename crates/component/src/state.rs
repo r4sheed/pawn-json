@@ -7,6 +7,7 @@
 //! nothing else calls in here, so a thread-local is all the state needs.
 
 use crate::amx::{Amx, Cell};
+use pawn_json_core::api::Walks;
 use pawn_json_core::dom::NodeId;
 use pawn_json_core::file::Saver;
 use pawn_json_core::pool::Pool;
@@ -30,13 +31,15 @@ pub struct Script {
     pub cp: Codepage,
 }
 
-/// How far a `JSON_IterKey` loop has got: the object's document, node and generation, and
-/// the index of the last key it handed out.
-pub type KeyWalk = (u32, NodeId, u32, u32);
+/// How far a `JSON_IterKey` loop has got: the object's document, node and generation, the
+/// index of the last key it handed out, and the key count when the loop began.
+pub type KeyWalk = (u32, NodeId, u32, u32, u32);
 
 pub struct State {
     pub pool: Pool,
     pub saver: Saver,
+    /// The `JSON_Iter` and `JSON_IterEntry` loops in progress.
+    pub walks: Walks,
     /// The `JSON_IterKey` loops in progress, keyed by script and key buffer address.
     pub key_walks: HashMap<(u32, Cell), KeyWalk>,
     scripts: HashMap<usize, Script>,
@@ -50,6 +53,7 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
         pool: Pool::default(),
         saver: Saver::default(),
+        walks: Walks::default(),
         key_walks: HashMap::new(),
         scripts: HashMap::new(),
         next_id: 1,
@@ -82,10 +86,11 @@ impl State {
         self.script(amx);
     }
 
-    /// Frees every handle the script owns and forgets its `JSON_IterKey` loops.
+    /// Frees every handle the script owns and forgets its loops.
     pub fn unloaded(&mut self, amx: *mut Amx) {
         if let Some(s) = self.scripts.remove(&(amx as usize)) {
             self.pool.release_script(s.id);
+            self.walks.forget_script(s.id);
             self.key_walks.retain(|&(script, _), _| script != s.id);
         }
     }

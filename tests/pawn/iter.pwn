@@ -31,7 +31,9 @@ Iter_WalksAnArray()
     }
     T_Is(steps, 3);
 
-    // Breaking out leaves the walk half done; releasing the element ends it.
+    // Breaking out leaves the loop half done. Releasing the element doesn't end it, so
+    // that a loop releasing its element on every pass can't start over: the next loop
+    // carries on after the break.
     while (JSON_Iter(list, row))
     {
         JSON_GetNodeInt(row, v);
@@ -45,9 +47,25 @@ Iter_WalksAnArray()
     steps = 0;
     while (JSON_Iter(list, row))
     {
+        JSON_GetNodeInt(row, v);
+        steps++;
+    }
+    T_Is(steps, 1);
+    T_Is(v, 30);
+
+    // Setting the variable to 0 after a break is what starts the next loop afresh.
+    while (JSON_Iter(list, row))
+    {
+        break;
+    }
+    row = Node:0;
+    steps = 0;
+    while (JSON_Iter(list, row))
+    {
         steps++;
     }
     T_Is(steps, 3);
+    T_Is(JSON_CountNodes(), before);
 
     new Node:empty = JSON_Array(), Node:none;
     T_True(!JSON_Iter(empty, none));
