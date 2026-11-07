@@ -20,7 +20,7 @@ they are, so the same file loads in a few milliseconds.
 
 ## Install
 
-With sampctl, add `"r4sheed/pawn-json:v0.1.0"` (with the `v`) to your `pawn.json`
+With sampctl, add `"r4sheed/pawn-json:v0.2.0"` (with the `v`) to your `pawn.json`
 dependencies. `sampctl ensure` puts the include where the compiler finds it and unpacks
 the library under `dependencies/.resources/`; copy it from there into the server's
 `components/`. By hand: copy `pawn-json.dll` (or `pawn-json.so` on Linux) into

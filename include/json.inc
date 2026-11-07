@@ -59,7 +59,7 @@
 #endif
 #define _json_included
 
-#define JSON_VERSION "0.1.0"
+#define JSON_VERSION "0.2.0"
 
 const JSON_OK = 0;
 const JSON_ERR_NODE = 1;
