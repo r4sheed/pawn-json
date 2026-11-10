@@ -59,7 +59,7 @@
 #endif
 #define _json_included
 
-#define JSON_VERSION "0.2.0"
+#define JSON_VERSION "0.3.0"
 
 const JSON_OK = 0;
 // The first three have the numbers pawn-json 1.x used for them.
