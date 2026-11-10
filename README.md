@@ -33,7 +33,7 @@ needs an open.mp server, and there is no `legacy_plugins` entry to add.
 Simply install to your project:
 
 ```bash
-sampctl package install r4sheed/pawn-json
+sampctl install r4sheed/pawn-json
 ```
 
 Include in your code and begin using the library:
@@ -41,6 +41,11 @@ Include in your code and begin using the library:
 ```pawn
 #include <json>
 ```
+
+sampctl puts the include where the compiler finds it. The component itself is an open.mp
+component, not a legacy plugin, so copy `pawn-json.dll` (`pawn-json.so` on Linux) from
+`dependencies/.resources/pawn-json-*/components/` into your server's `components/`
+folder. Each release also has the library on its own, to download by hand.
 
 ## Usage
 
