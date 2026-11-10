@@ -62,10 +62,11 @@
 #define JSON_VERSION "0.2.0"
 
 const JSON_OK = 0;
+// The first three have the numbers pawn-json 1.x used for them.
 const JSON_ERR_NODE = 1;
-const JSON_ERR_CONTAINER = 2;
-const JSON_ERR_KEY = 3;
-const JSON_ERR_TYPE = 4;
+const JSON_ERR_KEY = 2;
+const JSON_ERR_TYPE = 3;
+const JSON_ERR_CONTAINER = 4;
 const JSON_ERR_BUFFER = 5;
 const JSON_ERR_RANGE = 6;
 const JSON_ERR_SYNTAX = 7;
@@ -318,7 +319,9 @@ stock operator~(const Node:nodes[], len)
 }
 
 // pawn-json 1.x's functions, so old scripts compile unchanged. They return the same
-// codes as the rest of the library. A few of 1.x's quirks are fixed rather than copied:
+// codes as the rest of the library, whose first three are 1.x's numbers: 1 for a bad node,
+// 2 for a missing key and 3 for the wrong type. JSON_GetObject keeps its own 1.x numbers,
+// 2 when the node isn't an object and 3 when the key is missing. A few of 1.x's quirks are fixed rather than copied:
 // reading a node no longer deletes it, the type of a missing key is JSON_NODE_MISSING
 // rather than JSON_NODE_NUMBER, and a child is a view instead of a copy. JSON_GetObject,
 // JSON_GetArray, JSON_ArrayObject and JSON_ArrayIterate reuse the handle already in the

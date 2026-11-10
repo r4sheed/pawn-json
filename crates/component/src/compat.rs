@@ -173,7 +173,14 @@ fn member(c: &Call, st: &State, node: Cell, key: usize) -> Result<(u32, NodeId),
 /// the value at `key` whatever its type.
 pub extern "C" fn get_object(amx: *mut Amx, params: *const Cell) -> Cell {
     run(amx, params, 3, |c, st| {
-        let (d, id) = member(c, st, c.args.cell(0), 1)?;
+        let (d, id) = match member(c, st, c.args.cell(0), 1) {
+            Ok(found) => found,
+            // 1.x's JSON_GetObject numbered these two unlike its other reads: 2 when the
+            // node isn't an object, 3 when the key is missing. Old scripts check for those.
+            Err(Error::Container) => return Ok(2),
+            Err(Error::Key) => return Ok(3),
+            Err(e) => return Err(e),
+        };
         view_into(c, st, 2, d, id)
     })
 }

@@ -4,17 +4,20 @@
 
 /// The codes every read and write returns, with 0 for success. A function that makes a
 /// node returns the node instead, or 0 if it could not, and never one of these.
+///
+/// The first three have pawn-json 1.x's numbers, so an old script that compares a read's
+/// result with 1, 2 or 3 still means the same thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Error {
     /// The handle names no node, or a node that has since been freed.
     Node = 1,
-    /// The node is not the object or array the call needs.
-    Container = 2,
     /// The key is not there, or the index is out of range.
-    Key = 3,
+    Key = 2,
     /// The value is of a different type than the one asked for.
-    Type = 4,
+    Type = 3,
+    /// The node is not the object or array the call needs.
+    Container = 4,
     /// The buffer was too short, so the string in it was cut to fit.
     Buffer = 5,
     /// The integer does not fit in 32 bits, so the variable was left as it was.

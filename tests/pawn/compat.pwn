@@ -88,7 +88,8 @@ Compat_Reads()
 
     new Node:obj;
     T_Is(JSON_GetObject(root, "pos", obj), 0);
-    T_Is(JSON_GetObject(root, "nope", obj), JSON_ERR_KEY);
+    T_Is(JSON_GetObject(root, "nope", obj), 3); // 1.x's own number for this one call
+    T_Is(JSON_GetObject(obj, "nope", obj), 2);  // and for a node that isn't an object
     T_Is(JSON_GetObject(Node:9999, "pos", obj), JSON_ERR_NODE);
 
     new Node:nums;

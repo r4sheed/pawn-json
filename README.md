@@ -15,7 +15,7 @@ they are, but loading a few thousand keys takes milliseconds instead of seconds,
 long list of 1.x's quiet mistakes are fixed. See [Compared to pawn-json 1.x](#compared-to-pawn-json-1x)
 for the measurements.
 
-- Reads are lookups, not copies. A 4000-key file loads in 1.5 ms, where 1.x takes 5 s.
+- Reads are lookups, not copies. A 4000-key file loads in 1.8 ms, where 1.x takes 5.8 s.
 - Children are views: write through one and the parent changes.
 - Nodes free themselves when the function that made them returns, and a node you pass to
   a helper survives it.
@@ -301,27 +301,63 @@ one most servers run.
 
 ### Speed
 
-Both plugins ran the same Pawn script, [bench/server/speed.pwn](bench/server/speed.pwn),
-on an open.mp 1.6.7 server: compiled once against 1.4.1's `json.inc` with its `json.dll`
-loaded as a legacy plugin, and once against this `json.inc` with the component. The
-script uses only 1.x functions, so it is exactly the code an existing gamemode runs. The
-times are measured inside Pawn, so they include everything a script pays: reading the
-file, the native calls, the conversion of strings. i7-8700K, Windows 11, the mean of 3
-runs for 1.4.1 and of 200 runs for this plugin, measured in the same sitting.
-
-| What the script does | pawn-json 1.4.1 | this plugin | |
+| Workload | pawn-json 1.4.1 | this plugin | speedup |
 | --- | ---: | ---: | ---: |
-| Load a language file, read every key: 500 keys, 36 KB | 89 ms | 0.26 ms | 340x |
-| ... 1000 keys, 71 KB | 399 ms | 0.45 ms | 900x |
-| ... 2000 keys, 143 KB | 1 373 ms | 0.73 ms | 1 890x |
-| ... 4000 keys, 288 KB | 5 060 ms | 1.5 ms | 3 370x |
-| Load a vehicle list, read every column: 500 rows, 160 KB | 271 ms | 1.0 ms | 270x |
-| ... 1000 rows, 320 KB | 1 190 ms | 1.9 ms | 630x |
-| ... 2000 rows, 640 KB | 4 999 ms | 3.9 ms | 1 300x |
-| 1000 reads of one string from an open 2000-key document | 507 ms | 0.12 ms | 4 400x |
-| 100 000 reads of one int from an open document | 188 ms | 7.7 ms | 24x |
+| Language file, read every key: 500 keys, 36 KB | 83.8 ms (81.9 - 92.2) | 0.216 ms (0.206 - 0.236) | 390x |
+| ... 1000 keys, 71 KB | 347 ms (328 - 479) | 0.446 ms (0.386 - 0.463) | 780x |
+| ... 2000 keys, 143 KB | 1 288 ms (1 217 - 1 896) | 0.789 ms (0.737 - 0.909) | 1 600x |
+| ... 4000 keys, 288 KB | 5 774 ms (5 401 - 6 450) | 1.78 ms (1.48 - 2.18) | 3 200x |
+| Vehicle list, read every column: 500 rows, 160 KB | 311 ms (298 - 339) | 1.18 ms (1.10 - 1.31) | 260x |
+| ... 1000 rows, 320 KB | 1 300 ms (1 130 - 1 507) | 2.61 ms (2.07 - 2.71) | 500x |
+| ... 2000 rows, 640 KB | 5 807 ms (5 443 - 6 082) | 4.56 ms (4.24 - 6.72) | 1 300x |
+| 1 000 string reads from an open 2000-key document | 501 ms (443 - 590) | 0.161 ms (0.139 - 0.259) | 3 100x |
+| 100 000 int reads from an open 11-key document | 176 ms (153 - 184) | 8.56 ms (7.22 - 12.5) | 21x |
 
-Every time 1.4.1 reads a value by key, it first copies the whole object it reads from,
+The time of one run of the workload: the median of 5 server boots, with the fastest and
+the slowest boot in brackets.
+
+**The workloads.** Each is one call of a Pawn function in
+[bench/server/speed.pwn](bench/server/speed.pwn), timed around the call, so it includes
+everything a script pays: reading the file, parsing, every native call, converting
+strings to the script's code page, and freeing the nodes when the function returns. The
+data comes from [make-data.py](bench/server/make-data.py) with a fixed seed.
+
+- *Language file*: `JSON_ParseFile` of a flat object of N short English strings, then
+  `JSON_Keys(root, i, key)` for i = 0, 1, ... until it fails and `JSON_GetString` of each
+  key - how a text loader reads a language file.
+- *Vehicle list*: `JSON_ParseFile` of `{"vehicles": [...]}` with N rows of 10 columns,
+  `JSON_GetArray`, `JSON_ArrayLength`, and per row `JSON_ArrayObject` and 10 typed reads
+  (3 ints, 4 floats, 2 strings and a bool).
+- *Open document*: the document is parsed once and kept; only the reads are timed. The
+  per-read cost is 161 ns for a string and 86 ns for an int, the call into the plugin
+  included.
+
+**The method.**
+
+- The same script, using only 1.x functions, compiled with pawncc 3.10.11 at its default
+  options once against each plugin's `json.inc`.
+- open.mp 1.6.7.3218, 32-bit Windows build. 1.4.1 is the official `json.dll` from its
+  GitHub release (sha256
+  `41ca9bc79d01579274387d1fff112111a4f87444205d9bc15d87e88a5fcc2269`), loaded as a legacy plugin. This plugin
+  is its release build (rustc 1.98.1, `i686-pc-windows-msvc`, `opt-level = 3`, LTO, one
+  codegen unit, mimalloc), loaded as a component.
+- The server's clock (`GetTickCount`) counts whole milliseconds, so each workload is run
+  again and again until a second has passed, and one run's time is the total divided by
+  the runs. A boot runs this plugin's fastest workload about 4 000 times; 1.4.1's slowest
+  takes 5 to 6 seconds for its one run.
+- 5 boots per plugin, taken in turn (1.4.1, this plugin, 1.4.1, ...), so that whatever
+  else the machine does falls on both alike.
+- Every workload sums what it read into a check value. The checks are the same on both
+  plugins, so both did the same work and read the same values.
+- Intel Core i7-8700K (6 cores, 3.7 GHz), 32 GB RAM, Windows 11 (22621). The machine was
+  not otherwise idle, which is what the ranges show. The files were in the OS's file
+  cache. Not measured: Linux, and a cold disk.
+
+To repeat it: `python bench/server/compare.py --server <open.mp folder> --pawncc <pawncc
+folder>`. It downloads 1.4.1's release, builds both servers under `bench/server/work/`,
+runs the boots and prints this table.
+
+**Why the difference.** Every time 1.4.1 reads a value by key, it first copies the whole object it reads from,
 then the value; `JSON_ArrayObject` copies the whole array to hand out one element; and
 `JSON_Keys` builds a list of every key on every call
 ([plugin.rs](https://github.com/Southclaws/pawn-json/blob/1.4.1/src/plugin.rs#L540-L560)).
@@ -361,9 +397,10 @@ And the ones a short script can't show:
   uses. Here it is the server's choice, or the script's.
 - **Plugin bugs.** Every native here catches a panic in its own code: that one call
   returns `JSON_ERR_INTERNAL`, the log says where, and the server carries on.
-- **Errors.** 1.4.1 uses 1, 2 and 3 for different things in different functions, and a
-  failed builder returns a number that looks like a node. Here one set of codes means the
-  same thing everywhere, and a failed builder returns 0.
+- **Errors.** 1.4.1 has no names for its codes, and a failed builder returns a number
+  that looks like a node. Here every code has a name, a failed builder returns 0, and the
+  codes keep 1.x's numbers for a bad node (1), a missing key (2) and the wrong type (3),
+  so old checks such as `== 2` still mean the same.
 
 ### How it is tested
 
@@ -377,13 +414,20 @@ And the ones a short script can't show:
   every step it checks that nothing panics, only documented codes come back, freed
   handles stay dead and every loop ends; at the end, no node may be left alive.
   `cargo test` runs 256 such scripts, CI 20 000 on each platform.
+- pawn-json 1.x's own tests pass: the 43 tests of
+  [test.pwn](https://github.com/Southclaws/pawn-json/blob/master/test.pwn) from
+  Southclaws/pawn-json run as [tests/pawn/upstream.pwn](tests/pawn/upstream.pwn), 126
+  checks. Three of the checks expected 1.x's old answers (sorted keys and
+  `66.5999984741211` in one, a node freed by the helper it was passed to, a missing node
+  typed as null); there the test says what this plugin answers instead, and why.
 - `tools/server-test.py` runs the Pawn scripts in `tests/pawn/` on a real open.mp server,
-  674 checks in ten scripts: lifetime across helpers, hooks and recursion, a filterscript unloaded
+  801 checks in eleven scripts: lifetime across helpers, hooks and recursion, a filterscript unloaded
   with its nodes, every 1.x function, the mistakes scripts actually make, saves queued
   right before shutdown landing on disk byte for byte, and code pages checked in the saved
   file's bytes.
-- CI runs all of it, with `clippy -D warnings`, on Windows and Linux for the 32-bit
-  targets the server uses.
+- CI runs all of it on every push, with `clippy -D warnings`, on Windows and Linux: the
+  Pawn tests on the open.mp server for each, so the Linux library is loaded by a real
+  server too, not only built.
 
 ## Upgrading from pawn-json 1.x
 
@@ -392,11 +436,13 @@ And the ones a short script can't show:
    `json.so` from `plugins/`.
 3. Recompile. 1.x code compiles unchanged.
 
-What behaves differently is what the table above shows: missing keys, short buffers and
-numbers past 32 bits now answer with an error code, children are views, and reading a
-node no longer deletes it. Text that 1.x turned into `&#225;` entities now arrives as
-real letters, so code that decoded those entities can go. Set `json.codepage` to the
-code page your players use.
+The error codes keep 1.x's numbers, so checks such as `== 2` for a missing key still
+work. What behaves differently is what the table above shows: short buffers and numbers
+past 32 bits answer with an error code instead of a quiet success, a missing key's type
+is `JSON_NODE_MISSING`, keys stay in the order they were written instead of sorted,
+children are views, and neither reading a node nor passing it to a function frees it.
+Text that 1.x turned into `&#225;` entities now arrives as real letters, so code that
+decoded those entities can go. Set `json.codepage` to the code page your players use.
 
 ## Building
 
@@ -421,8 +467,9 @@ The first needs no server. The second copies `omp-server.exe` and pawncc into
 `test-server/` and `tools/pawncc/` on its first run, then runs each script in
 `tests/pawn/` on 127.0.0.1:7797 and prints `PASS n FAIL m` for each.
 
-To repeat the comparison with 1.4.1, put `bench/server/speed.pwn` or `quirks.pwn` into a
-server's `gamemodes/`, generate its data with `python bench/server/make-data.py
+`python bench/server/compare.py`, with the same two options, repeats the speed comparison
+with 1.4.1. To see the behaviour table, put `bench/server/quirks.pwn` into a server's
+`gamemodes/`, generate its data with `python bench/server/make-data.py
 <server>/scriptfiles`, and compile it once against each `json.inc`.
 
 ## Licence
