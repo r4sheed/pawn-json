@@ -19,10 +19,15 @@ use pawn_json_core::dom::{Doc, NodeId, Val};
 use pawn_json_core::error::{Error, OK};
 use pawn_json_core::pool::Pool;
 
-/// Reads the `i`th variadic argument. Pawn passes every variadic argument by address, so
-/// this goes through the pointer.
-fn var(c: &Call, i: usize) -> Result<Cell, Error> {
-    c.args.read(i).ok_or(Error::Address)
+/// Releases the nodes a builder was passed and could not use, and returns no node. 1.x
+/// took its arguments whether or not the call worked, and most of them are temporaries
+/// such as `JSON_Int(1)`, which no variable holds and nothing else would ever free.
+fn given_up(st: &mut State, nodes: &[Cell], why: &str) -> Cell {
+    st.log(Level::Warning, why);
+    for &h in nodes {
+        st.pool.release(h);
+    }
+    0
 }
 
 /// `Node:JSON_Object({_, Node}:...)`. With no arguments it makes an empty object; given
@@ -31,31 +36,27 @@ fn var(c: &Call, i: usize) -> Result<Cell, Error> {
 pub extern "C" fn object(amx: *mut Amx, params: *const Cell) -> Cell {
     run_zero(amx, params, 0, |c, st| {
         let n = c.args.count();
+        // Pawn passes every variadic argument by address. The nodes are every second one.
+        let nodes: Vec<Cell> = (1..n).step_by(2).filter_map(|i| c.args.read(i)).collect();
         if n % 2 != 0 {
-            st.log(
-                Level::Warning,
-                "JSON_Object: the arguments are not key and node pairs",
-            );
-            return Ok(0);
+            let why = "JSON_Object: the arguments are not key and node pairs";
+            return Ok(given_up(st, &nodes, why));
         }
         let mut doc = Doc::new(Val::empty_object());
-        let mut taken = Vec::with_capacity(n / 2);
         for pair in 0..n / 2 {
-            let key = pawn_json_core::text::to_string(
-                c.args.string(2 * pair).ok_or(Error::Address)?,
-                c.cp,
-            );
-            let h = var(c, 2 * pair + 1)?;
-            let Some(r) = st.pool.resolve(h) else {
-                st.log(Level::Warning, "JSON_Object: a node passed is gone");
-                return Ok(0);
+            let Some(key) = c.args.string(2 * pair) else {
+                return Ok(given_up(st, &nodes, "JSON_Object: a key is not a string"));
+            };
+            let key = pawn_json_core::text::to_string(key, c.cp);
+            let node = c.args.read(2 * pair + 1);
+            let Some(r) = node.and_then(|h| st.pool.resolve(h)) else {
+                return Ok(given_up(st, &nodes, "JSON_Object: a node passed is gone"));
             };
             let id = doc.copy_from(st.pool.doc(r.doc), r.node);
             let root = doc.root();
             doc.obj_put(root, &key, id).expect("an object");
-            taken.push(h);
         }
-        Ok(made(c, st, doc, &taken))
+        Ok(made(c, st, doc, &nodes))
     })
 }
 
@@ -63,20 +64,18 @@ pub extern "C" fn object(amx: *mut Amx, params: *const Cell) -> Cell {
 /// 1.x's builder and takes ownership of the nodes.
 pub extern "C" fn array(amx: *mut Amx, params: *const Cell) -> Cell {
     run_zero(amx, params, 0, |c, st| {
-        let mut doc = Doc::new(Val::Arr(Vec::new()));
-        let mut taken = Vec::with_capacity(c.args.count());
-        for i in 0..c.args.count() {
-            let h = var(c, i)?;
-            let Some(r) = st.pool.resolve(h) else {
-                st.log(Level::Warning, "JSON_Array: a node passed is gone");
-                return Ok(0);
+        let n = c.args.count();
+        let nodes: Vec<Cell> = (0..n).filter_map(|i| c.args.read(i)).collect();
+        let mut doc = Doc::new(Val::Arr(Vec::with_capacity(n)));
+        for i in 0..n {
+            let Some(r) = c.args.read(i).and_then(|h| st.pool.resolve(h)) else {
+                return Ok(given_up(st, &nodes, "JSON_Array: a node passed is gone"));
             };
             let id = doc.copy_from(st.pool.doc(r.doc), r.node);
             let root = doc.root();
             doc.arr_push_node(root, id).expect("an array");
-            taken.push(h);
         }
-        Ok(made(c, st, doc, &taken))
+        Ok(made(c, st, doc, &nodes))
     })
 }
 

@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
 pawn-json-core = { path = "../core" }
+rustc-hash = "2"
 
 [dev-dependencies]
 # Random scripts for the model test in src/model.rs.

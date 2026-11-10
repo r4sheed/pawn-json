@@ -12,8 +12,8 @@ use pawn_json_core::dom::NodeId;
 use pawn_json_core::file::Saver;
 use pawn_json_core::pool::Pool;
 use pawn_json_core::text::Codepage;
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::c_void;
 
 pub type LogFn = extern "C" fn(ctx: *mut c_void, level: i32, msg: *const u8, len: usize);
@@ -31,9 +31,20 @@ pub struct Script {
     pub cp: Codepage,
 }
 
-/// How far a `JSON_IterKey` loop has got: the object's document, node and generation, the
-/// index of the last key it handed out, and the key count when the loop began.
-pub type KeyWalk = (u32, NodeId, u32, u32, u32);
+/// How far a `JSON_IterKey` loop has got.
+#[derive(Clone, Copy)]
+pub struct KeyWalk {
+    /// The object: its document's serial, its node and that node's generation.
+    pub doc: u64,
+    pub node: NodeId,
+    pub generation: u32,
+    /// The index of the last key handed out, and the key count when the loop began.
+    pub index: u32,
+    pub end: u32,
+    /// Whether that key left the buffer empty, being empty itself or cut to nothing. An
+    /// empty buffer then means the loop goes on, where it otherwise means a new loop.
+    pub blank: bool,
+}
 
 pub struct State {
     pub pool: Pool,
@@ -41,8 +52,8 @@ pub struct State {
     /// The `JSON_Iter` and `JSON_IterEntry` loops in progress.
     pub walks: Walks,
     /// The `JSON_IterKey` loops in progress, keyed by script and key buffer address.
-    pub key_walks: HashMap<(u32, Cell), KeyWalk>,
-    scripts: HashMap<usize, Script>,
+    pub key_walks: FxHashMap<(u32, Cell), KeyWalk>,
+    scripts: FxHashMap<usize, Script>,
     next_id: u32,
     default_cp: Codepage,
     logger: Option<(*mut c_void, LogFn)>,
@@ -54,8 +65,8 @@ thread_local! {
         pool: Pool::default(),
         saver: Saver::default(),
         walks: Walks::default(),
-        key_walks: HashMap::new(),
-        scripts: HashMap::new(),
+        key_walks: FxHashMap::default(),
+        scripts: FxHashMap::default(),
         next_id: 1,
         default_cp: Codepage::DEFAULT,
         logger: None,

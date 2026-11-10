@@ -93,14 +93,18 @@ impl Doc {
     fn parse_from<'de, R: serde_json::de::Read<'de>>(
         de: &mut serde_json::Deserializer<R>,
     ) -> Result<Doc, ParseError> {
-        let mut doc = Doc {
-            nodes: Vec::new(),
-            free: Vec::new(),
-            root: 0,
+        let mut b = Building {
+            doc: Doc {
+                nodes: Vec::new(),
+                free: Vec::new(),
+                root: 0,
+            },
+            ids: Vec::new(),
+            entries: Vec::new(),
         };
-        doc.root = Seed(&mut doc).deserialize(&mut *de)?;
+        b.doc.root = Seed(&mut b).deserialize(&mut *de)?;
         de.end()?;
-        Ok(doc)
+        Ok(b.doc)
     }
 
     pub fn root(&self) -> NodeId {
@@ -149,19 +153,31 @@ impl Doc {
     /// Frees `id` and everything under it. A node whose generation counter has run out is
     /// retired rather than reused, so a stale handle can never end up naming a newer node.
     pub fn free_subtree(&mut self, id: NodeId) {
-        let mut stack = vec![id];
+        // Most values freed are a number or a string, which need no stack at all, and an
+        // array's own list of children serves as one.
+        let mut stack = match self.free_node(id) {
+            Val::Arr(v) => v,
+            Val::Obj(m) => m.into_values().collect(),
+            _ => return,
+        };
         while let Some(n) = stack.pop() {
-            let node = &mut self.nodes[n as usize];
-            match std::mem::replace(&mut node.val, Val::Null) {
+            match self.free_node(n) {
                 Val::Arr(v) => stack.extend(v),
                 Val::Obj(m) => stack.extend(m.into_values()),
                 _ => {}
             }
-            node.generation = node.generation.wrapping_add(1);
-            if node.generation != u32::MAX {
-                self.free.push(n);
-            }
         }
+    }
+
+    /// Frees the one node `id` and returns the value it held, children and all.
+    fn free_node(&mut self, id: NodeId) -> Val {
+        let node = &mut self.nodes[id as usize];
+        let val = std::mem::replace(&mut node.val, Val::Null);
+        node.generation = node.generation.wrapping_add(1);
+        if node.generation != u32::MAX {
+            self.free.push(id);
+        }
+        val
     }
 
     /// Makes `id` the root and frees the old one, which must not hold any children, since
@@ -362,7 +378,17 @@ impl<'de> de::Deserialize<'de> for Key {
     }
 }
 
-struct Seed<'a>(&'a mut Doc);
+/// A document while it is being parsed. An array's elements and an object's entries
+/// are gathered on these two stacks, which every level of the document shares, until
+/// their container closes. Only then is its list or map made, once and at its final
+/// size, where growing it entry by entry would allocate and move it several times over.
+struct Building {
+    doc: Doc,
+    ids: Vec<NodeId>,
+    entries: Vec<(Box<str>, NodeId)>,
+}
+
+struct Seed<'a>(&'a mut Building);
 
 impl<'de> DeserializeSeed<'de> for Seed<'_> {
     type Value = NodeId;
@@ -378,48 +404,54 @@ impl<'de> Visitor<'de> for Seed<'_> {
         f.write_str("a JSON value")
     }
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<NodeId, E> {
-        Ok(self.0.alloc(Val::Bool(v)))
+        Ok(self.0.doc.alloc(Val::Bool(v)))
     }
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<NodeId, E> {
-        Ok(self.0.alloc(Val::Int(v)))
+        Ok(self.0.doc.alloc(Val::Int(v)))
     }
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<NodeId, E> {
         let val = match i64::try_from(v) {
             Ok(v) => Val::Int(v),
             Err(_) => Val::Float(v as f64),
         };
-        Ok(self.0.alloc(val))
+        Ok(self.0.doc.alloc(val))
     }
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<NodeId, E> {
-        Ok(self.0.alloc(Val::Float(v)))
+        Ok(self.0.doc.alloc(Val::Float(v)))
     }
     fn visit_str<E: de::Error>(self, v: &str) -> Result<NodeId, E> {
-        Ok(self.0.alloc(Val::Str(Box::from(v))))
+        Ok(self.0.doc.alloc(Val::Str(Box::from(v))))
     }
     fn visit_string<E: de::Error>(self, v: String) -> Result<NodeId, E> {
-        Ok(self.0.alloc(Val::Str(v.into_boxed_str())))
+        Ok(self.0.doc.alloc(Val::Str(v.into_boxed_str())))
     }
     fn visit_unit<E: de::Error>(self) -> Result<NodeId, E> {
-        Ok(self.0.alloc(Val::Null))
+        Ok(self.0.doc.alloc(Val::Null))
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<NodeId, A::Error> {
-        let doc = self.0;
-        let mut v = Vec::with_capacity(a.size_hint().unwrap_or(0));
-        while let Some(id) = a.next_element_seed(Seed(&mut *doc))? {
-            v.push(id);
+        let b = self.0;
+        let start = b.ids.len();
+        while let Some(id) = a.next_element_seed(Seed(&mut *b))? {
+            b.ids.push(id);
         }
-        Ok(doc.alloc(Val::Arr(v)))
+        let v: Vec<NodeId> = b.ids.drain(start..).collect();
+        Ok(b.doc.alloc(Val::Arr(v)))
     }
     fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<NodeId, A::Error> {
-        let doc = self.0;
-        let mut m = Map::with_capacity_and_hasher(a.size_hint().unwrap_or(0), FxBuildHasher);
+        let b = self.0;
+        let start = b.entries.len();
         while let Some(Key(k)) = a.next_key()? {
-            let id = a.next_value_seed(Seed(&mut *doc))?;
+            let id = a.next_value_seed(Seed(&mut *b))?;
+            b.entries.push((k, id));
+        }
+        let mut m = Map::with_capacity_and_hasher(b.entries.len() - start, FxBuildHasher);
+        for (k, id) in b.entries.drain(start..) {
+            // A key written twice keeps its first place and takes its last value.
             if let Some(old) = m.insert(k, id) {
-                doc.free_subtree(old);
+                b.doc.free_subtree(old);
             }
         }
-        Ok(doc.alloc(Val::Obj(m)))
+        Ok(b.doc.alloc(Val::Obj(m)))
     }
 }
 

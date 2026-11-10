@@ -17,7 +17,8 @@
 //! buffer of `size` cells, and `o` gets a view) and pack reads from it. A `?` after a
 //! value means a missing key or element leaves its variables as they are instead of
 //! failing; pack has no use for that and refuses it. The format is parsed only once,
-//! walking the document in step with it.
+//! walking the document in step with it. It may nest as deep as a parsed document may,
+//! `MAX_DEPTH` levels; a deeper one is refused as a bad format.
 
 use crate::dom::{Doc, NodeId, Val};
 use crate::error::Error;
@@ -45,9 +46,15 @@ pub struct Failure {
     pub at: usize,
 }
 
+/// How deep a format may nest, the same depth the parser reads a document to. Each
+/// level is a call inside the next, so without a limit a long run of `[` would run the
+/// server out of stack.
+pub const MAX_DEPTH: usize = 128;
+
 struct Fmt<'a> {
     s: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +67,29 @@ struct Leaf {
 impl<'a> Fmt<'a> {
     fn fail<T>(&self, error: Error) -> Result<T, Failure> {
         Err(Failure { error, at: self.i })
+    }
+
+    fn new(format: &'a str) -> Fmt<'a> {
+        Fmt {
+            s: format.as_bytes(),
+            i: 0,
+            depth: 0,
+        }
+    }
+
+    /// Steps over the `{` or `[` that opens an object or an array.
+    fn open(&mut self) -> Result<(), Failure> {
+        if self.depth == MAX_DEPTH {
+            return self.fail(Error::Format);
+        }
+        self.depth += 1;
+        self.i += 1;
+        Ok(())
+    }
+
+    /// The object or array has been read to its closing bracket.
+    fn close(&mut self) {
+        self.depth -= 1;
     }
 
     fn peek(&mut self) -> Option<u8> {
@@ -164,7 +194,7 @@ impl<A: Args> Unpack<'_, '_, A> {
     fn value(&mut self, f: &mut Fmt, node: Option<NodeId>) -> Result<(), Failure> {
         match f.peek() {
             Some(b'{') => {
-                f.i += 1;
+                f.open()?;
                 let map = match node.map(|n| self.pool.doc(self.doc).val(n)) {
                     Some(Val::Obj(_)) | None => node,
                     Some(_) => return f.fail(Error::Type),
@@ -191,11 +221,12 @@ impl<A: Args> Unpack<'_, '_, A> {
                     }
                     f.expect(b'}')?;
                 }
+                f.close();
                 f.eat(b'?');
                 Ok(())
             }
             Some(b'[') => {
-                f.i += 1;
+                f.open()?;
                 let items = match node.map(|n| self.pool.doc(self.doc).val(n)) {
                     Some(Val::Arr(_)) | None => node,
                     Some(_) => return f.fail(Error::Type),
@@ -222,6 +253,7 @@ impl<A: Args> Unpack<'_, '_, A> {
                     }
                     f.expect(b']')?;
                 }
+                f.close();
                 f.eat(b'?');
                 Ok(())
             }
@@ -306,10 +338,7 @@ pub fn unpack<A: Args>(
         at: 0,
     };
     let r = pool.resolve(node).ok_or(start)?;
-    let mut f = Fmt {
-        s: format.as_bytes(),
-        i: 0,
-    };
+    let mut f = Fmt::new(format);
     let mut u = Unpack {
         pool,
         doc: r.doc,
@@ -338,7 +367,7 @@ impl<A: Args> Pack<'_, '_, A> {
     fn value(&mut self, f: &mut Fmt, doc: &mut Doc) -> Result<NodeId, Failure> {
         match f.peek() {
             Some(b'{') => {
-                f.i += 1;
+                f.open()?;
                 let obj = doc.alloc(Val::empty_object());
                 if !f.eat(b'}') {
                     loop {
@@ -353,11 +382,12 @@ impl<A: Args> Pack<'_, '_, A> {
                     }
                     f.expect(b'}')?;
                 }
+                f.close();
                 self.no_optional(f)?;
                 Ok(obj)
             }
             Some(b'[') => {
-                f.i += 1;
+                f.open()?;
                 let arr = doc.alloc(Val::Arr(Vec::new()));
                 if !f.eat(b']') {
                     loop {
@@ -370,6 +400,7 @@ impl<A: Args> Pack<'_, '_, A> {
                     }
                     f.expect(b']')?;
                 }
+                f.close();
                 self.no_optional(f)?;
                 Ok(arr)
             }
@@ -435,10 +466,7 @@ pub fn pack<A: Args>(
     format: &str,
     args: &A,
 ) -> Result<Cell, Failure> {
-    let mut f = Fmt {
-        s: format.as_bytes(),
-        i: 0,
-    };
+    let mut f = Fmt::new(format);
     let mut doc = Doc::new(Val::Null);
     let mut p = Pack {
         pool,
@@ -717,5 +745,27 @@ pub mod tests {
         doc.arr_push(node, Val::Int(3)).unwrap();
         let (doc, node) = pool.get(row).unwrap();
         assert_eq!(to_string(doc, node, false), r#"{"pos":[1,2,3]}"#);
+    }
+
+    #[test]
+    fn a_format_nests_as_deep_as_a_document_and_no_deeper() {
+        let mut pool = Pool::default();
+        let nest = |n: usize| format!("{}i{}", "[".repeat(n), "]".repeat(n));
+        let one = Fake(vec![vec![7]]);
+        let h = pack(&mut pool, CP, ME, &nest(MAX_DEPTH), &one).unwrap();
+        let mut out = Fake(vec![vec![0]]);
+        assert_eq!(
+            unpack(&mut pool, CP, ME, h, &nest(MAX_DEPTH), &mut out),
+            Ok(())
+        );
+        assert_eq!(out.0[0][0], 7);
+        // One level more is refused, and so is a run of brackets long enough to have run
+        // the stack out.
+        for bad in [nest(MAX_DEPTH + 1), "[".repeat(200_000)] {
+            let packed = pack(&mut pool, CP, ME, &bad, &one).map_err(|f| f.error);
+            assert_eq!(packed, Err(Error::Format));
+            let unpacked = unpack(&mut pool, CP, ME, h, &bad, &mut out).map_err(|f| f.error);
+            assert_eq!(unpacked, Err(Error::Format));
+        }
     }
 }

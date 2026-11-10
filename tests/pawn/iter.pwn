@@ -123,6 +123,15 @@ Iter_WalksKeysInFileOrder()
     T_True(order[0] == 'z' && order[1] == 'a' && order[2] == 'm');
     T_Is(key[0], 0);
 
+    // An empty key is a key like any other: the loop hands it out and moves on.
+    new Node:blank, steps;
+    JSON_Parse("{\"a\":1,\"\":2,\"b\":3}", blank);
+    while (JSON_IterKey(blank, key) && steps < 10)
+    {
+        steps++;
+    }
+    T_Is(steps, 3);
+
     new before = JSON_CountNodes(), sum, v;
     new Node:value;
     while (JSON_IterEntry(o, key, value))

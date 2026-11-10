@@ -106,6 +106,12 @@ fn finish(file: File, tmp: &str, path: &str) -> io::Result<()> {
 ///
 /// Each save gets a temporary file of its own, so two saves to one path in a row never
 /// write into a file the thread is still finishing.
+///
+/// A save waiting for the thread holds its temporary file open, and a process may only
+/// have so many files open at once, about a thousand on Linux. So at most `MAX_QUEUED`
+/// saves wait: a script that saves faster than the disk confirms, a thousand player files
+/// in one go, is held back to the disk's pace once the queue is full, where an endless
+/// queue would have its later saves fail.
 #[derive(Default)]
 pub struct Saver {
     shared: Arc<Shared>,
@@ -115,6 +121,9 @@ pub struct Saver {
     made: u64,
 }
 
+/// How many saves may wait for the thread at once, each with a file open.
+pub const MAX_QUEUED: usize = 128;
+
 #[derive(Default)]
 struct Shared {
     queue: Mutex<Queue>,
@@ -122,6 +131,8 @@ struct Shared {
     work: Condvar,
     /// Wakes `flush` when the last queued save is done.
     idle: Condvar,
+    /// Wakes `save` when a full queue has room again.
+    room: Condvar,
     /// Whether `failures` holds anything, so a server tick can look without the lock.
     failed: AtomicBool,
 }
@@ -148,10 +159,22 @@ impl Saver {
     pub fn save(&mut self, doc: &Doc, node: NodeId, path: &str, pretty: bool) -> io::Result<()> {
         names_a_file(path)?;
         let text = write::to_string(doc, node, pretty);
+        let queued = self.start();
+        if queued {
+            // Before the temporary file is made, so the files open stay within the limit.
+            let mut q = lock(&self.shared.queue);
+            while q.open >= MAX_QUEUED {
+                q = self
+                    .shared
+                    .room
+                    .wait(q)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
         self.made += 1;
         let tmp = format!("{path}.{}.tmp", self.made);
         let file = begin(&tmp, text.as_bytes(), |f, bytes| f.write_all(bytes))?;
-        if !self.start() {
+        if !queued {
             return finish(file, &tmp, path);
         }
         let mut q = lock(&self.shared.queue);
@@ -202,6 +225,11 @@ impl Saver {
                 .wait(q)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// How many saves are queued or being finished right now.
+    pub fn queued(&self) -> usize {
+        lock(&self.shared.queue).open
     }
 
     /// The saves that failed on the thread since the last call, each as `path: error`.
@@ -271,6 +299,9 @@ fn finish_queued(shared: &Shared) {
         q.open -= 1;
         if q.open == 0 {
             shared.idle.notify_all();
+        }
+        if q.open == MAX_QUEUED - 1 {
+            shared.room.notify_all();
         }
     }
 }
@@ -386,6 +417,28 @@ mod tests {
             assert_eq!(got, format!("[{last}]"));
         }
         assert!(temporaries(&dir).is_empty());
+    }
+
+    /// A script that saves far more files than the queue holds, all at once: the queue
+    /// never grows past its limit, and every file still lands.
+    #[test]
+    fn a_burst_of_saves_waits_for_room_in_the_queue() {
+        let dir = folder("saver-burst");
+        let mut saver = Saver::default();
+        let saves = MAX_QUEUED * 3;
+        for i in 0..saves {
+            let path = file_in(&dir, &format!("f{i}.json"));
+            save_text(&mut saver, &path, &format!("[{i}]")).unwrap();
+            assert!(saver.queued() <= MAX_QUEUED, "{} queued", saver.queued());
+        }
+        saver.flush();
+        assert_eq!(saver.queued(), 0);
+        for i in 0..saves {
+            let got = std::fs::read_to_string(file_in(&dir, &format!("f{i}.json"))).unwrap();
+            assert_eq!(got, format!("[{i}]"));
+        }
+        assert!(temporaries(&dir).is_empty());
+        assert!(saver.take_failures().is_empty());
     }
 
     #[test]

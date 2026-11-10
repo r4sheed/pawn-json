@@ -285,6 +285,7 @@ dependencies = [
  "mimalloc",
  "pawn-json-core",
  "proptest",
+ "rustc-hash",
 ]
 
 [[package]]

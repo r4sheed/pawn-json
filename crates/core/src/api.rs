@@ -13,7 +13,7 @@ use crate::file::Saver;
 use crate::pool::{Cell, Owner, Pool};
 use crate::text::{self, Codepage};
 use crate::write;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 fn found(pool: &Pool, h: Cell) -> Result<(u32, NodeId), Error> {
     let r = pool.resolve(h).ok_or(Error::Node)?;
@@ -656,10 +656,12 @@ pub fn pack<A: crate::format::Args>(
 /// The loops in progress, keyed by script and element variable. Each variable has a stack,
 /// innermost loop last.
 pub struct Walks {
-    loops: HashMap<(u32, Cell), Vec<Walk>>,
+    loops: FxHashMap<(u32, Cell), Vec<Walk>>,
     /// This tick's walks, by script, variable and container (document, node and
-    /// generation).
-    rewalks: HashMap<(u32, Cell, u32, NodeId, u32), Rewalk>,
+    /// generation). The document goes by its serial, so two documents that follow each
+    /// other in one place of the pool, as the rows of a file do, are never counted as
+    /// one container walked again.
+    rewalks: FxHashMap<(u32, Cell, u64, NodeId, u32), Rewalk>,
     budget: u32,
     /// Set when a loop runs out of steps, until `take_stopped`.
     stopped: bool,
@@ -677,6 +679,11 @@ struct Rewalk {
 /// again from the top.
 pub const STEP_BUDGET: u32 = 5_000_000;
 
+/// How many containers a tick remembers having walked. A long load walks a great many,
+/// each once; when the list is full, the ones walked only once are forgotten, and the
+/// ones that were started over, which are the ones the budget is for, stay.
+const REWALKS_KEPT: usize = 4096;
+
 impl Default for Walks {
     fn default() -> Walks {
         Walks::with_budget(STEP_BUDGET)
@@ -687,7 +694,8 @@ impl Default for Walks {
 struct Walk {
     /// What the loop last put in the variable.
     handle: Cell,
-    doc: u32,
+    /// The container: its document's serial, its node and that node's generation.
+    doc: u64,
     container: NodeId,
     generation: u32,
     /// The index of that element, and where the loop stops.
@@ -713,8 +721,8 @@ fn spent(r: &mut Rewalk, budget: u32, stopped: &mut bool) -> bool {
 impl Walks {
     pub fn with_budget(budget: u32) -> Walks {
         Walks {
-            loops: HashMap::new(),
-            rewalks: HashMap::new(),
+            loops: FxHashMap::default(),
+            rewalks: FxHashMap::default(),
             budget,
             stopped: false,
         }
@@ -772,9 +780,17 @@ fn release_element(pool: &mut Pool, script: u32, h: Cell) {
     }
 }
 
+/// Where a loop's step landed: the container walked, as document and node, and the
+/// index of the element now in the variable.
+struct Stepped {
+    doc: u32,
+    container: NodeId,
+    index: usize,
+}
+
 /// One step of the loop over `container` whose element variable is at address `var` and
-/// holds `el`. Returns the index and node of the next element, now in `el`, or `None`
-/// once the loop is done. `objects_only` is for `JSON_IterEntry`.
+/// holds `el`. Returns where the step landed, its element now in `el`, or `None` once the
+/// loop is done. `objects_only` is for `JSON_IterEntry`.
 fn advance(
     pool: &mut Pool,
     walks: &mut Walks,
@@ -783,7 +799,7 @@ fn advance(
     container: Cell,
     el: &mut Cell,
     objects_only: bool,
-) -> Option<(usize, NodeId)> {
+) -> Option<Stepped> {
     let key = (owner.script, var);
     let holds_top = walks
         .loops
@@ -804,14 +820,15 @@ fn advance(
         return None;
     };
     let generation = pool.doc(d).generation(node);
-    let walked = (owner.script, var, d, node, generation);
+    let serial = pool.doc_serial(d);
+    let walked = (owner.script, var, serial, node, generation);
     let len = match pool.doc(d).val(node) {
         Val::Obj(m) => m.len(),
         Val::Arr(v) if !objects_only => v.len(),
         _ => 0,
     };
     let stack = walks.loops.entry(key).or_default();
-    let this = |w: &Walk| (w.doc, w.container, w.generation) == (d, node, generation);
+    let this = |w: &Walk| (w.doc, w.container, w.generation) == (serial, node, generation);
     let mut fresh_view = false;
     match stack.iter().rposition(this) {
         Some(k) if holds_top => {
@@ -834,11 +851,17 @@ fn advance(
             }
         }
         _ => {
-            let r = walks.rewalks.entry(walked).or_default();
-            r.starts += 1;
-            let counted = r.starts > 1;
-            if counted && spent(r, walks.budget, &mut walks.stopped) {
-                return None;
+            // Counted from the second start on the same container.
+            let counted = walks.rewalks.contains_key(&walked);
+            if !counted && walks.rewalks.len() >= REWALKS_KEPT {
+                walks.rewalks.retain(|_, r| r.starts > 1);
+            }
+            if counted || walks.rewalks.len() < REWALKS_KEPT {
+                let r = walks.rewalks.entry(walked).or_default();
+                r.starts += 1;
+                if counted && spent(r, walks.budget, &mut walks.stopped) {
+                    return None;
+                }
             }
             if holds_top {
                 // A loop inside another, on the outer loop's variable: the outer
@@ -856,7 +879,7 @@ fn advance(
             }
             stack.push(Walk {
                 handle: 0,
-                doc: d,
+                doc: serial,
                 container: node,
                 generation,
                 index: u32::MAX,
@@ -906,7 +929,11 @@ fn advance(
     {
         r.steps += 1;
     }
-    Some((at as usize, id))
+    Some(Stepped {
+        doc: d,
+        container: node,
+        index: at as usize,
+    })
 }
 
 /// Ends the innermost loop of a variable: its element is released, and the variable
@@ -963,12 +990,15 @@ pub fn iter_entry(
     key: &mut [Cell],
     el: &mut Cell,
 ) -> bool {
-    let Some((at, _)) = advance(pool, walks, owner, var, obj, el, true) else {
+    let Some(step) = advance(pool, walks, owner, var, obj, el, true) else {
         return false;
     };
-    let (d, node) = found(pool, obj).expect("the object was just walked");
-    if let Val::Obj(m) = pool.doc(d).val(node) {
-        let (k, _) = m.get_index(at).expect("an index below the length");
+    // The key is read from the object the step walked. The handle `obj` is no way back
+    // to it: when the script passes the element variable as the object too, the step
+    // has just pointed that handle at the element.
+    if let Val::Obj(m) = pool.doc(step.doc).val(step.container)
+        && let Some((k, _)) = m.get_index(step.index)
+    {
         let _ = text::put(key, k, cp);
     }
     true
@@ -1845,6 +1875,31 @@ mod tests {
         assert_eq!((walks.len(), pool.live_handles()), (2, 3));
         walks.forget(&mut pool, ME.script, var("row") - 4, 2);
         assert_eq!((walks.len(), pool.live_handles()), (0, 1));
+    }
+
+    /// The object's handle read back into the loop's own variable, and that variable
+    /// passed as the object: the step moves the handle on to the element, and the key
+    /// still comes from the object walked.
+    #[test]
+    fn an_entry_loop_over_its_own_variable_reads_the_key_it_walked() {
+        let mut pool = Pool::default();
+        let mut walks = Walks::default();
+        let root = root(&mut pool, r#"{"x":{"a":1,"b":{},"c":3}}"#);
+        let mut x = 0;
+        assert_eq!(get_node(&mut pool, CP, ME, root, &s("x"), &mut x), OK);
+        let (mut v, mut key) = (0, [0; 8]);
+        let at = var("val");
+        assert!(iter_entry(
+            &mut pool, &mut walks, CP, ME, at, x, &mut key, &mut v
+        ));
+        assert_eq!(back(&key), "a");
+        // `JSON_GetNode(root, "x", v)`: the element's handle now names the object.
+        assert_eq!(get_node(&mut pool, CP, ME, root, &s("x"), &mut v), OK);
+        let obj = v;
+        assert!(iter_entry(
+            &mut pool, &mut walks, CP, ME, at, obj, &mut key, &mut v
+        ));
+        assert_eq!(back(&key), "b");
     }
 
     #[test]

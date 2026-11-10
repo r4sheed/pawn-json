@@ -8,7 +8,7 @@
 use crate::amx::{Amx, Args, Cell};
 use crate::compat;
 use crate::lifetime;
-use crate::state::{self, Level, State};
+use crate::state::{self, KeyWalk, Level, State};
 use pawn_json_core::api;
 use pawn_json_core::error::{Error, OK};
 use pawn_json_core::pool::Owner;
@@ -38,40 +38,35 @@ pub(crate) fn run(
     arity: usize,
     body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
 ) -> Cell {
-    run_or(Error::Internal as Cell, amx, params, arity, body)
+    crate::guard::catch(Error::Internal as Cell, || {
+        run_unguarded(amx, params, arity, |e| e as Cell, body)
+    })
 }
 
-/// `run` for a native that returns a node, a bool or a count rather than a code. If it
-/// fails inside the plugin it returns 0, which is no node, false or none, where a code
-/// would read as a node handle, or as true and keep a loop going.
+/// `run` for a native that returns a node, a bool or a count rather than a code. Whatever
+/// goes wrong - a bug inside the plugin, a bad address, an argument the call didn't pass,
+/// as when the script was built with another version's include - it returns 0, which is
+/// no node, false or none. A code there would read as a node handle, or as true and keep
+/// a loop going for ever.
 pub(crate) fn run_zero(
     amx: *mut Amx,
     params: *const Cell,
     arity: usize,
     body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
 ) -> Cell {
-    run_or(0, amx, params, arity, body)
-}
-
-fn run_or(
-    fallback: Cell,
-    amx: *mut Amx,
-    params: *const Cell,
-    arity: usize,
-    body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
-) -> Cell {
-    crate::guard::catch(fallback, || run_unguarded(amx, params, arity, body))
+    crate::guard::catch(0, || run_unguarded(amx, params, arity, |_| 0, body))
 }
 
 fn run_unguarded(
     amx: *mut Amx,
     params: *const Cell,
     arity: usize,
+    failed: impl Fn(Error) -> Cell,
     body: impl FnOnce(&Call, &mut State) -> Result<Cell, Error>,
 ) -> Cell {
     let args = unsafe { Args::new(amx, params) };
     if args.count() < arity {
-        return Error::Address as Cell;
+        return failed(Error::Address);
     }
     state::with(|st| {
         let script = st.script(args.amx());
@@ -83,7 +78,7 @@ fn run_unguarded(
             },
             cp: script.cp,
         };
-        body(&call, st).unwrap_or_else(|e| e as Cell)
+        body(&call, st).unwrap_or_else(failed)
     })
 }
 
@@ -801,6 +796,9 @@ extern "C" fn json_get_as(amx: *mut Amx, params: *const Cell) -> Cell {
             _ => Error::Type as Cell,
         };
         if code == OK && !c.args.write(4, v) {
+            if c.args.cell(2) == NODE {
+                st.pool.release(v);
+            }
             return Err(Error::Address);
         }
         Ok(code)
@@ -852,37 +850,48 @@ extern "C" fn json_iter_entry(amx: *mut Amx, params: *const Cell) -> Cell {
 /// of the key buffer. An empty buffer starts a new loop, and the buffer is emptied again
 /// when the keys run out.
 extern "C" fn json_iter_key(amx: *mut Amx, params: *const Cell) -> Cell {
+    use pawn_json_core::dom::Val;
     run_zero(amx, params, 3, |c, st| {
         let slot = (c.owner.script, c.args.cell(1));
         let size = usize::try_from(c.args.cell(2)).map_err(|_| Error::Address)?;
         let (p, n) = c.args.buffer(1, size).ok_or(Error::Address)?;
         let out = unsafe { std::slice::from_raw_parts_mut(p, n) };
-        let fresh = out[0] == 0;
-        let key = st.pool.resolve(c.args.cell(0)).and_then(|r| {
+        let under_way = st.key_walks.get(&slot).copied();
+        // A key that is empty, or cut to nothing by a buffer of one cell, leaves the
+        // buffer as a new loop finds it. The loop that wrote it is still under way.
+        let fresh = out[0] == 0 && !under_way.is_some_and(|w| w.blank);
+        let next = st.pool.resolve(c.args.cell(0)).and_then(|r| {
             let doc = st.pool.doc(r.doc);
-            let generation = doc.generation(r.node);
-            let pawn_json_core::dom::Val::Obj(m) = doc.val(r.node) else {
+            let Val::Obj(m) = doc.val(r.node) else {
                 return None;
             };
+            let (serial, generation) = (st.pool.doc_serial(r.doc), doc.generation(r.node));
             // As with JSON_Iter, the walk stops at the key count it began with, so a loop
             // that adds keys still ends.
-            let (at, end) = match st.key_walks.get(&slot) {
-                Some(&(d, node, g, i, end))
-                    if !fresh && (d, node, g) == (r.doc, r.node, generation) =>
+            let (index, end) = match under_way {
+                Some(w)
+                    if !fresh && (w.doc, w.node, w.generation) == (serial, r.node, generation) =>
                 {
-                    (i + 1, end)
+                    (w.index + 1, w.end)
                 }
                 _ => (0, m.len() as u32),
             };
-            if at >= end {
+            if index >= end {
                 return None;
             }
-            m.get_index(at as usize)
-                .map(|(k, _)| (k.clone(), (r.doc, r.node, generation, at, end)))
+            let (key, _) = m.get_index(index as usize)?;
+            let _ = pawn_json_core::text::put(out, key, c.cp);
+            Some(KeyWalk {
+                doc: serial,
+                node: r.node,
+                generation,
+                index,
+                end,
+                blank: out[0] == 0,
+            })
         });
-        match key {
-            Some((k, walk)) => {
-                let _ = pawn_json_core::text::put(out, &k, c.cp);
+        match next {
+            Some(walk) => {
                 st.key_walks.insert(slot, walk);
                 Ok(1)
             }
@@ -1041,6 +1050,65 @@ mod tests {
         assert!(s.cell_at(node) > 0);
     }
 
+    /// Reads the unpacked string at `addr` back out of the script's data.
+    fn text_at(s: &Script, addr: Cell) -> String {
+        s.data[addr as usize / 4..]
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect()
+    }
+
+    /// Every key `JSON_IterKey` hands out for `node`, stopping the test if the loop takes
+    /// more steps than the object has keys.
+    fn keys_of(s: &mut Script, node: Cell, key: Cell, size: Cell, most: usize) -> Vec<String> {
+        let mut keys = Vec::new();
+        while s.call(find("JSON_IterKey"), &[node, key, size]) != 0 {
+            keys.push(text_at(s, key));
+            assert!(keys.len() <= most, "the loop went round again: {keys:?}");
+        }
+        keys
+    }
+
+    /// An empty key leaves the buffer looking like a new loop's. The walk still moves on.
+    #[test]
+    fn a_key_loop_gets_past_an_empty_key() {
+        let mut s = Script::new(256);
+        let text = s.string(br#"{"a":1,"":2,"b":3}"#);
+        let node = s.put(&[0]);
+        assert_eq!(s.call(find("JSON_Parse"), &[text, node]), OK);
+        let h = s.cell_at(node);
+        let key = s.put(&[0; 8]);
+        assert_eq!(keys_of(&mut s, h, key, 8, 3), ["a", "", "b"]);
+        // A buffer with room for the terminator alone holds every key cut to nothing.
+        assert_eq!(keys_of(&mut s, h, key, 1, 3), ["", "", ""]);
+        // And the loop after it starts from the top again.
+        assert_eq!(keys_of(&mut s, h, key, 8, 3), ["a", "", "b"]);
+    }
+
+    /// A loop left with `break` carries on only over the object it was walking. Another
+    /// document of the same shape, parsed into the same variable, is a new loop, even
+    /// though it takes the freed document's place in the pool.
+    #[test]
+    fn a_key_loop_left_early_starts_over_on_another_document() {
+        let mut s = Script::new(256);
+        let first = s.string(br#"{"a":1,"b":2,"c":3}"#);
+        let second = s.string(br#"{"x":1,"y":2,"z":3}"#);
+        let node = s.put(&[0]);
+        let key = s.put(&[0; 8]);
+        assert_eq!(s.call(find("JSON_Parse"), &[first, node]), OK);
+        let h = s.cell_at(node);
+        assert_eq!(s.call(find("JSON_IterKey"), &[h, key, 8]), 1);
+        assert_eq!(s.call(find("JSON_IterKey"), &[h, key, 8]), 1);
+        assert_eq!(text_at(&s, key), "b");
+        // `break`. The next two rows are parsed into the same variable: the first of them
+        // is skipped, and the second lands where the walked document was.
+        assert_eq!(s.call(find("JSON_Parse"), &[second, node]), OK);
+        assert_eq!(s.call(find("JSON_Parse"), &[second, node]), OK);
+        let h = s.cell_at(node);
+        assert_eq!(keys_of(&mut s, h, key, 8, 3), ["x", "y", "z"]);
+    }
+
     #[test]
     fn parse_and_get_int_run_through_the_amx() {
         let mut s = Script::new(256);
@@ -1054,6 +1122,63 @@ mod tests {
         assert_eq!(s.cell_at(v), 411);
         assert_eq!(s.call(json_get_int, &[h, big, v]), Error::Range as Cell);
         assert_eq!(s.cell_at(v), 411, "a failed read leaves the variable");
+    }
+
+    /// A native that returns a node or a bool has no room for a code: 11 would be a
+    /// node's handle, or true. A script built with an older include, calling with an
+    /// argument short, must not get a loop that never ends.
+    #[test]
+    fn a_native_that_returns_no_code_answers_zero_for_a_bad_call() {
+        let mut s = Script::new(64);
+        let list = s.string(b"[1,2]");
+        let node = s.put(&[0]);
+        assert_eq!(s.call(find("JSON_Parse"), &[list, node]), OK);
+        let h = s.cell_at(node);
+        let far = 1 << 20;
+        assert_eq!(s.call(find("JSON_Iter"), &[h]), 0);
+        assert_eq!(s.call(find("JSON_Iter"), &[h, far]), 0);
+        assert_eq!(s.call(find("JSON_IterKey"), &[h, far, 8]), 0);
+        assert_eq!(s.call(find("JSON_IterEntry"), &[h, far, far, 8]), 0);
+        assert_eq!(s.call(find("JSON_HasKey"), &[h, far]), 0);
+        assert_eq!(s.call(find("JSON_TypeOf"), &[h, far]), 0);
+        assert_eq!(s.call(find("JSON_SetCodepage"), &[far]), 0);
+        assert_eq!(s.call(find("JSON_Pack"), &[far]), 0);
+        assert_eq!(s.call(find("JSON_Copy"), &[]), 0);
+        assert_eq!(s.call(find("JSON_Up"), &[]), 0);
+        assert_eq!(s.call(find("JSON_Append"), &[h]), 0);
+        assert_eq!(s.call(find("JSON_Object"), &[far, node]), 0);
+        assert_eq!(s.call(find("JSON_Array"), &[far]), 0);
+    }
+
+    /// 1.x's builders take the nodes they are passed. Those are mostly temporaries no
+    /// variable holds, so a builder that fails has to take them too, or they are left
+    /// behind until the script unloads.
+    #[test]
+    fn a_builder_that_fails_still_takes_its_nodes() {
+        let mut s = Script::new(128);
+        let (one, key) = (s.string(b"1"), s.string(b"k"));
+        let (a, b) = (s.put(&[0]), s.put(&[0]));
+        let live = |s: &mut Script| s.call(find("JSON_CountNodes"), &[]);
+        let fresh = |s: &mut Script| {
+            assert_eq!(s.call(find("JSON_Parse"), &[one, a]), OK);
+            assert_eq!(s.call(find("JSON_Parse"), &[one, b]), OK);
+            let gone = s.cell_at(b);
+            assert_eq!(s.call(find("JSON_Release"), &[gone]), OK);
+        };
+        fresh(&mut s);
+        assert_eq!(live(&mut s), 1);
+        assert_eq!(s.call(find("JSON_Object"), &[key, a, key, b]), 0);
+        assert_eq!(live(&mut s), 0, "a node that is gone was among them");
+        fresh(&mut s);
+        assert_eq!(s.call(find("JSON_Array"), &[a, b]), 0);
+        assert_eq!(live(&mut s), 0);
+        fresh(&mut s);
+        assert_eq!(s.call(find("JSON_Object"), &[key, a, key]), 0);
+        assert_eq!(live(&mut s), 0, "a key with no node after it");
+        fresh(&mut s);
+        let built = s.call(find("JSON_Object"), &[key, a]);
+        assert!(built > 0);
+        assert_eq!(live(&mut s), 1, "the node went into the new object");
     }
 
     #[test]

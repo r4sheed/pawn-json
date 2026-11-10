@@ -42,6 +42,9 @@ struct Slot {
 struct DocSlot {
     doc: Doc,
     handles: u32,
+    /// Which document this is, counted from the first one made. A place in `docs` is
+    /// used again once its document is gone, and this number never is.
+    serial: u64,
 }
 
 /// The handles the scripts hold. A handle is `index | generation << 20`, which is always
@@ -53,6 +56,7 @@ pub struct Pool {
     free: Vec<u32>,
     docs: Vec<Option<DocSlot>>,
     doc_free: Vec<u32>,
+    docs_made: u64,
     limit: u32,
     live: usize,
 }
@@ -74,6 +78,7 @@ impl Pool {
             free: Vec::new(),
             docs: Vec::new(),
             doc_free: Vec::new(),
+            docs_made: 0,
             limit: limit.min(INDEX_MASK),
             live: 0,
         }
@@ -143,7 +148,12 @@ impl Pool {
     pub fn root(&mut self, doc: Doc, owner: Owner) -> Cell {
         let node = doc.root();
         let node_generation = doc.generation(node);
-        let slot = DocSlot { doc, handles: 0 };
+        self.docs_made += 1;
+        let slot = DocSlot {
+            doc,
+            handles: 0,
+            serial: self.docs_made,
+        };
         let d = match self.doc_free.pop() {
             Some(d) => {
                 self.docs[d as usize] = Some(slot);
@@ -245,6 +255,16 @@ impl Pool {
 
     pub fn doc_mut(&mut self, d: u32) -> &mut Doc {
         &mut self.doc_slot_mut(d).doc
+    }
+
+    /// A number that names document `d` for the whole run. Whatever remembers a node
+    /// across calls goes by this and not by `d`, which the next document to be made may
+    /// be given once this one is gone.
+    pub fn doc_serial(&self, d: u32) -> u64 {
+        self.docs[d as usize]
+            .as_ref()
+            .expect("a handle's document is live")
+            .serial
     }
 
     /// Borrows two different documents at once, the first to write to and the second to
@@ -510,6 +530,21 @@ mod tests {
         assert_eq!(value(&pool, el), Val::Int(20));
         assert_eq!(value(&pool, next), Val::Int(30));
         assert_ne!(pool.walk(arr, d, n2, ME), arr, "a root is never re-pointed");
+    }
+
+    #[test]
+    fn a_document_s_place_is_used_again_and_its_serial_is_not() {
+        let mut pool = Pool::default();
+        let first = parse(&mut pool, "[1]");
+        let (d, serial) = {
+            let r = pool.resolve(first).unwrap();
+            (r.doc, pool.doc_serial(r.doc))
+        };
+        pool.release(first);
+        let second = parse(&mut pool, "[1]");
+        let r = pool.resolve(second).unwrap();
+        assert_eq!(r.doc, d);
+        assert_ne!(pool.doc_serial(r.doc), serial);
     }
 
     #[test]

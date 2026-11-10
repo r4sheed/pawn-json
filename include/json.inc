@@ -218,7 +218,9 @@ native JSON_NextEntry(Node:object, &cursor, &Node:value, key[], size = sizeof (k
 // Setting or appending a node copies its value in. If that node is the only handle to
 // its own document (a fresh JSON_Array(), say), it is used up and freed, so
 // JSON_SetNode(o, "list", JSON_Array()) doesn't leak - just like 1.x. A view, or a node
-// whose document is still in use elsewhere, is left as it was.
+// whose document is still in use elsewhere, is left as it was. A node you kept with
+// JSON_Keep is used up the same way: to set a node and still have it afterwards, pass
+// JSON_Copy(node).
 
 native JSON_SetInt(Node:node, const key[], value);
 native JSON_SetFloat(Node:node, const key[], Float:value);

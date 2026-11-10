@@ -103,10 +103,12 @@ fn scalar(v: &Val, out: &mut String) {
 fn float(f: f64, out: &mut String) {
     let mut b = zmij::Buffer::new();
     let s = b.format_finite(f);
-    match s.find("e+") {
-        Some(e) => {
-            out.push_str(&s[..=e]);
-            out.push_str(&s[e + 2..]);
+    // A `+` can only be the exponent's sign. Looking for the one byte is a good deal
+    // cheaper on text this short than a search for "e+".
+    match s.bytes().position(|b| b == b'+') {
+        Some(plus) => {
+            out.push_str(&s[..plus]);
+            out.push_str(&s[plus + 1..]);
         }
         None => out.push_str(s),
     }
