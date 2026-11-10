@@ -8,8 +8,10 @@ The first run needs to know where to find an open.mp server and a pawncc to copy
 
     python tools/server-test.py --server C:/open.mp --pawncc C:/pawncc
 
-(or set OMP_SERVER and PAWNCC). It copies omp-server.exe with the Pawn and Console
-components into test-server/, and pawncc into tools/pawncc/; later runs reuse them.
+(or set OMP_SERVER and PAWNCC). It copies omp-server with the Pawn and Console
+components into test-server/, and pawncc into tools/pawncc/; later runs reuse them. The
+pawncc folder holds pawncc with its library (pawnc.dll, or libpawnc.so on Linux). It runs
+on Windows and on Linux, each with the server and compiler built for it.
 
 Each tests/pawn/<name>.pwn becomes the gamemode of its own short server run on
 127.0.0.1:7797. The script runs its checks in OnGameModeInit, prints "PASS n FAIL m" and
@@ -35,12 +37,34 @@ SERVER = os.path.join(ROOT, "test-server")
 PAWNCC = os.path.join(ROOT, "tools", "pawncc")
 TESTS = os.path.join(ROOT, "tests", "pawn")
 FAILS = os.path.join(TESTS, "fail")
-LIBRARY = os.path.join(ROOT, "target", "i686-pc-windows-msvc", "release", "pawn_json.dll")
 PORT = 7797
 TIMEOUT_S = 60
 
-SERVER_FILES = ["omp-server.exe", "components/Pawn.dll", "components/Console.dll"]
-PAWNCC_FILES = ["pawncc.exe", "pawnc.dll"]
+if os.name == "nt":
+    TARGET = "i686-pc-windows-msvc"
+    LIBRARY = os.path.join(ROOT, "target", TARGET, "release", "pawn_json.dll")
+    COMPONENT = "pawn-json.dll"
+    SERVER_EXE = "omp-server.exe"
+    SERVER_FILES = [SERVER_EXE, "components/Pawn.dll", "components/Console.dll"]
+    PAWNCC_EXE = "pawncc.exe"
+    PAWNCC_FILES = [PAWNCC_EXE, "pawnc.dll"]
+else:
+    TARGET = "i686-unknown-linux-gnu"
+    LIBRARY = os.path.join(ROOT, "target", TARGET, "release", "libpawn_json.so")
+    COMPONENT = "pawn-json.so"
+    SERVER_EXE = "omp-server"
+    SERVER_FILES = [SERVER_EXE, "components/Pawn.so", "components/Console.so"]
+    PAWNCC_EXE = "pawncc"
+    PAWNCC_FILES = [PAWNCC_EXE, "libpawnc.so"]
+
+
+def pawncc(args):
+    # The Linux pawncc finds libpawnc.so through the library path.
+    env = dict(os.environ)
+    if os.name != "nt":
+        env["LD_LIBRARY_PATH"] = PAWNCC + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    return subprocess.run([os.path.join(PAWNCC, PAWNCC_EXE)] + args, capture_output=True,
+                          text=True, env=env)
 
 # Files a test writes that it can't check from Pawn: we look at the bytes after the
 # server has exited. Each is deleted before the run, so a file an earlier run left can't
@@ -116,10 +140,7 @@ def port_free():
 def compile_script(src, folder, name):
     os.makedirs(os.path.join(SERVER, folder), exist_ok=True)
     out = os.path.join(SERVER, folder, name + ".amx")
-    r = subprocess.run(
-        [os.path.join(PAWNCC, "pawncc.exe"), src,
-         "-i" + os.path.join(ROOT, "include"), "-i" + TESTS, "-o" + out],
-        capture_output=True, text=True)
+    r = pawncc([src, "-i" + os.path.join(ROOT, "include"), "-i" + TESTS, "-o" + out])
     text = (r.stdout + r.stderr).strip()
     lines = [l for l in text.splitlines() if not l.startswith("Pawn compiler") and l.strip()]
     # A warning counts as a failure too: the include should build clean.
@@ -156,7 +177,7 @@ def write_config(name):
 def run_server():
     """Returns the server's output, the PASS/FAIL counts (None if it never printed them)
     and whether we had to kill it."""
-    proc = subprocess.Popen([os.path.join(SERVER, "omp-server.exe")], cwd=SERVER,
+    proc = subprocess.Popen([os.path.join(SERVER, SERVER_EXE)], cwd=SERVER,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, text=True, errors="replace")
     lines, result = [], [None]
@@ -191,8 +212,7 @@ def run_server():
 def compile_fails_as_expected(src):
     want = [l[len("// expect:"):].strip() for l in open(src, encoding="utf-8") if l.startswith("// expect:")]
     out = os.path.join(SERVER, "fail.amx")
-    r = subprocess.run([os.path.join(PAWNCC, "pawncc.exe"), src, "-i" + os.path.join(ROOT, "include"),
-                        "-o" + out], capture_output=True, text=True)
+    r = pawncc([src, "-i" + os.path.join(ROOT, "include"), "-o" + out])
     text = r.stdout + r.stderr
     missing = [w for w in want if w not in text]
     name = os.path.basename(src)
@@ -209,11 +229,11 @@ def main():
     if not copy_missing(PAWNCC_FILES, option("--pawncc", "PAWNCC"), PAWNCC, "pawncc"):
         return 1
     if "--no-build" not in sys.argv:
-        r = subprocess.run(["cargo", "build", "--release", "--target", "i686-pc-windows-msvc",
-                            "-p", "pawn-json"], cwd=ROOT)
+        r = subprocess.run(["cargo", "build", "--release", "--target", TARGET, "-p", "pawn-json"],
+                           cwd=ROOT)
         if r.returncode != 0:
             return 1
-    shutil.copy2(LIBRARY, os.path.join(SERVER, "components", "pawn-json.dll"))
+    shutil.copy2(LIBRARY, os.path.join(SERVER, "components", COMPONENT))
 
     failed = 0
     for name in names:

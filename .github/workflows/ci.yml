@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# The server and the compiler the Pawn tests run on.
+env:
+  OMP: https://github.com/openmultiplayer/open.mp/releases/download/v1.6.7.3218
+  PAWNC: https://github.com/openmultiplayer/compiler/releases/download/v3.10.11
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -23,6 +28,14 @@ jobs:
           PROPTEST_CASES: "20000"
       - run: cargo build --release --target i686-pc-windows-msvc -p pawn-json
       - run: python tools/exports.py target/i686-pc-windows-msvc/release/pawn_json.dll
+      - name: The Pawn tests on an open.mp server
+        shell: bash
+        run: |
+          curl -sSfL -o omp.zip "$OMP/open.mp-win-x86.zip"
+          curl -sSfL -o pawnc.zip "$PAWNC/pawnc-3.10.11-windows.zip"
+          7z x -y -oomp omp.zip > /dev/null
+          7z x -y pawnc.zip > /dev/null
+          python tools/server-test.py --no-build --server omp/Server --pawncc pawnc-3.10.11-windows/bin
 
   linux:
     runs-on: ubuntu-latest
@@ -30,7 +43,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
+      # The 32-bit server needs the 32-bit libatomic as well.
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib lib32atomic1
       - run: rustup target add i686-unknown-linux-gnu
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --exclude jsonbench --target i686-unknown-linux-gnu
@@ -41,3 +55,10 @@ jobs:
           PROPTEST_CASES: "20000"
       - run: cargo build --release --target i686-unknown-linux-gnu -p pawn-json
       - run: python3 tools/exports.py target/i686-unknown-linux-gnu/release/libpawn_json.so
+      - name: The Pawn tests on an open.mp server
+        run: |
+          mkdir -p omp pawncc
+          curl -sSfL "$OMP/open.mp-linux-x86.tar.gz" | tar -xz -C omp
+          curl -sSfL "$PAWNC/pawnc-3.10.11-linux.tar.gz" | tar -xz
+          cp pawnc-3.10.11-linux/bin/pawncc pawnc-3.10.11-linux/lib/libpawnc.so pawncc/
+          python3 tools/server-test.py --no-build --server omp/Server --pawncc pawncc
