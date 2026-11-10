@@ -8,25 +8,68 @@
 > corrected, optimized and tested by Claude Fable 5.2. Review the source before deploying
 > it to a production server.
 
-JSON for open.mp scripts: parse files, read values, build documents and save them. It is
-a drop-in successor to [Southclaws/pawn-json](https://github.com/Southclaws/pawn-json):
-every 1.x function is still there under its old name, so existing scripts compile as
-they are, but loading a few thousand keys takes milliseconds instead of seconds, and a
-long list of 1.x's quiet mistakes are fixed. See [Compared to pawn-json 1.x](#compared-to-pawn-json-1x)
-for the measurements.
+JSON for open.mp scripts: parse files, read values, build documents and save them. A
+drop-in replacement for [Southclaws/pawn-json](https://github.com/Southclaws/pawn-json)
+1.x: every 1.x function is still there under its old name.
 
-- Reads are lookups, not copies. A 4000-key file loads in 1.8 ms, where 1.x takes 5.8 s.
-- Children are views: write through one and the parent changes.
-- Nodes free themselves when the function that made them returns, and a node you pass to
-  a helper survives it.
-- One call reads a whole row: `JSON_Unpack(row, "{model:i, pos:[f, f, f], plate:s[16]}", ...)`.
-- Strings follow the server's code page, so `Café Señor` arrives as `Café Señor`, not as
-  `Caf&#233; Se&#241;or`.
-- Saves go through a temporary file, so a crash never leaves half a file behind.
-- Every call returns `JSON_OK` or a `JSON_ERR_*` code that says what went wrong.
+## Why use it instead of pawn-json 1.x
 
-It is an open.mp component (a small C++ shell on the open.mp SDK around a Rust core), so it
-needs an open.mp server, and there is no `legacy_plugins` entry to add.
+**It is fast where 1.x is slow.** 1.x copies the whole document on every read, so a file
+with many keys takes seconds to load. Measured on a real open.mp server, the same script
+on both plugins ([how](#speed)):
+
+| | pawn-json 1.4.1 | this plugin | |
+| --- | ---: | ---: | ---: |
+| Load a 4000-key language file, read every key | 5.8 s | 1.8 ms | 3 200x faster |
+| Load a 2000-row vehicle list, read every column | 5.8 s | 4.6 ms | 1 300x faster |
+| Read one string from a document kept open | 501 µs | 0.16 µs | 3 100x faster |
+
+**It fixes what 1.x gets quietly wrong.** Shown side by side on both plugins
+([the table](#behaviour)):
+
+- A string that doesn't fit the buffer: 1.x says success and writes nothing.
+- A number past 32 bits: 1.x says success and hands back a wrong number.
+- Accented letters: 1.x turns `Café` into `Caf&#233;`.
+- `JSON_SetFloat(o, "x", 2165.9163)`: 1.x writes `2165.916259765625`.
+- A node passed to a helper function: 1.x frees it when the helper returns.
+- A child read from an object: 1.x hands out a copy, so writing to it changes nothing.
+- A save interrupted by a crash: 1.x writes the file in place and can leave it cut short.
+
+**It is tested harder.** 1.x's own test suite passes on it (where a test expected one of
+the bugs above, it now expects the fix), along with 675 more checks on real open.mp
+servers, Windows and Linux, on every push ([how](#how-it-is-tested)).
+
+**It adds what 1.x lacks.** Read a whole row in one call (`JSON_Unpack(row, "{model:i,
+pos:[f, f, f], plate:s[16]}", ...)`), build one (`JSON_Pack`), read deep with a path
+(`"/vehicles/3/model"`), loop with `while (JSON_Iter(list, row))`, and get an error code
+with a name for everything that can go wrong.
+
+## FAQ
+
+**Do I have to change my code?** No. Every 1.x function keeps its name and arguments, so
+an existing script compiles as it is, and the error codes keep 1.x's numbers (1 bad
+node, 2 missing key, 3 wrong type). What changes is what the list above fixes: if your
+code relied on one of those 1.x bugs, that part behaves differently now. See
+[Upgrading from pawn-json 1.x](#upgrading-from-pawn-json-1x).
+
+**Does it run on a SA-MP server, or as a legacy plugin?** No. It is an open.mp component
+and loads only from an open.mp server's `components/` folder. A SA-MP 0.3.7 server can't
+load it, and neither can open.mp's `legacy_plugins`. On SA-MP, stay on pawn-json 1.x.
+
+**Can I keep the old plugin loaded next to it?** No: both provide the same functions.
+Remove `json` from `legacy_plugins` and the old `json.dll` / `json.so`.
+
+**Windows and Linux?** Both, as 32-bit libraries like the server itself. Every push runs
+the full test suite on an open.mp server on each.
+
+**Which compiler?** It is tested with the open.mp compiler, pawncc 3.10.11.
+
+**PawnPlus and YSI?** Nodes survive a PawnPlus `await`, since a task resumes in the frame
+it waited in. A YSI inline function has a frame of its own, so a node made inside one is
+freed when it ends; `JSON_Keep` it to hold on to it.
+
+**What if the plugin itself has a bug?** That one call returns `JSON_ERR_INTERNAL` and the
+server log says where; the server keeps running.
 
 ## Installation
 
@@ -164,10 +207,47 @@ node it is given, so nothing leaks. `JSON_SaveFile` writes a temporary file and 
 in, so a crash mid-save leaves the old file whole; the wait for the disk happens on a
 background thread, so a save doesn't stall the server.
 
+How long `Teleport` takes when the name it looks for is the last one:
+
+| Teleports | `JSON_Iter` + `JSON_Unpack` each (above) | read the name first, unpack the match | a Pawn enum array and `strcmp` | an object keyed by name |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 20 µs | 13 µs | 10 µs | |
+| 100 | 186 µs | 122 µs | 94 µs | |
+| 1000 | 1.86 ms | 1.17 ms | 0.78 ms | 0.98 µs |
+
+Unpacking a row costs about 1.9 µs, so for a command that walks a few hundred rows the
+loop above is fine, and close to what plain Pawn arrays cost. If you look things up by
+name often, or keep thousands of them, key the object by name instead: the lookup takes
+about a microsecond however many there are.
+
+```pawn
+// {"ls": {"pos": [...], ...}, "lv": {...}}
+JSON_SetNode(gTeleports, name, JSON_Pack("{pos:[f, f, f], angle:f, interior:i, world:i}",
+    x, y, z, angle, interior, world));
+
+new Node:teleport;
+if (JSON_GetNode(gTeleports, name, teleport) == JSON_OK)
+{
+    JSON_Unpack(teleport, "{pos:[f, f, f], angle:f, interior:i, world:i}",
+        x, y, z, angle, interior, world);
+}
+```
+
+Keys are matched exactly, so store and look up names in one case.
+
 ### Texts kept in memory
 
-A document you keep open costs well under a microsecond per read, so there is no need to
-copy a language file into Pawn arrays.
+A document you keep open is as cheap to read from as Pawn's own string functions, so
+there is no need to copy a language file into Pawn arrays:
+
+| One call | Time |
+| --- | ---: |
+| An empty Pawn function | 32 ns |
+| `strlen` of a 64-character string | 65 ns |
+| Copying that string out of a Pawn array with `strcat` | 109 ns |
+| The same with `format(text, sizeof (text), "%s", line)` | 132 ns |
+| `JSON_GetString` of a text from an open 2000-key document | 171 ns |
+| `JSON_GetString` from an open 11-key document | 146 ns |
 
 ```pawn
 new Node:gTexts;
@@ -320,6 +400,10 @@ one most servers run.
 
 The time of one run of the workload: the median of 5 server boots, with the fastest and
 the slowest boot in brackets.
+
+The usage examples' numbers come from [bench/server/usage.pwn](bench/server/usage.pwn),
+run the same way on this plugin: each operation repeated in a loop for a second, the loop
+included (an empty one takes 20 ns a step), median of 5 boots.
 
 **The workloads.** Each is one call of a Pawn function in
 [bench/server/speed.pwn](bench/server/speed.pwn), timed around the call, so it includes
